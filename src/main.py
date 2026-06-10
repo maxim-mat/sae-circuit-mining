@@ -4,6 +4,7 @@ import hashlib
 import torch
 import pandas as pd
 import argparse
+import logging
 from datasets import load_dataset
 from sae_lens import SAE
 from transformer_lens import HookedTransformer
@@ -29,20 +30,20 @@ def parse_args():
     parser.add_argument(
         "--threshold", 
         type=float, 
-        default=0.1, 
+        default=0.0, 
         help="Activation threshold for logging events (applied to relative or absolute depending on --threshold_type)."
     )
     parser.add_argument(
         "--threshold_type",
         type=str,
         choices=["relative", "absolute"],
-        default="relative",
+        default="absolute",
         help="Whether the threshold is applied to 'relative' or 'absolute' activations."
     )
     parser.add_argument(
         "--num_prompts", 
         type=int, 
-        default=None, 
+        default=None,
         help="Number of prompts to process (default: None, meaning all of the dataset)."
     )
     parser.add_argument(
@@ -96,8 +97,22 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logger = logging.getLogger("sae_circuit_mining")
+
+    logger.info("Initializing SAE Circuit Mining event generator...")
+    logger.info(f"Parameters: release={args.release}, device={args.device}, threshold={args.threshold} ({args.threshold_type}), use_top_k={args.use_top_k}, top_k={args.top_k}")
+
     # Load models and configurations
+    logger.info(f"Retrieving pre-trained SAE directory map for release: {args.release}...")
     release_saes = get_pretrained_saes_directory()[args.release].saes_map
+    
+    logger.info("Loading transformer model 'gpt2-small'...")
     model = HookedTransformer.from_pretrained("gpt2-small", device=args.device)
 
     sorted_sae_items = sorted(
@@ -105,18 +120,24 @@ def main():
         key=lambda x: int(x[0].split('.')[1]) if '.' in x[0] else 0
     )
 
+    logger.info(f"Loading {len(sorted_sae_items)} SAEs for layers...")
     sae_objects = {sid: SAE.from_pretrained(release=args.release, sae_id=sid, device=args.device)[0] for sid, _ in sorted_sae_items}
+    logger.info("All SAEs loaded successfully.")
+    
     context_size = getattr(list(sae_objects.values())[0].cfg, "context_size", 1024)
     prepend_bos = getattr(list(sae_objects.values())[0].cfg, "prepend_bos", True)
 
+    logger.info(f"Loading HuggingFace dataset: {args.dataset}...")
     dataset = load_dataset(path=args.dataset, split="train", streaming=False)
+    
+    logger.info("Tokenizing and concatenating dataset...")
     token_dataset = tokenize_and_concatenate(dataset, model.tokenizer, streaming=True, max_length=context_size, add_bos_token=prepend_bos)
 
     # Global lists to accumulate data for batch writing
     if args.save_raw_activations:
         # Clear old output directory if it exists
         if os.path.exists(args.raw_activations_dir):
-            print(f"Output directory '{args.raw_activations_dir}' already exists. Clearing old files...")
+            logger.info(f"Output directory '{args.raw_activations_dir}' already exists. Clearing old files...")
             shutil.rmtree(args.raw_activations_dir)
         os.makedirs(args.raw_activations_dir, exist_ok=True)
 
@@ -147,7 +168,7 @@ def main():
         def flush_batch():
             if len(batch_data['prompt_idx']) == 0:
                 return
-            print(f"Flushing {len(batch_data['prompt_idx'])} activation values to partitioned dataset...")
+            logger.info(f"Flushing {len(batch_data['prompt_idx'])} activation values to partitioned dataset...")
             table = pa.Table.from_pydict(batch_data, schema=raw_schema)
             pq.write_to_dataset(
                 table, 
@@ -164,9 +185,10 @@ def main():
         all_events = []
         all_cases = []
 
-    print("Processing dataset...")
+    logger.info("Processing dataset...")
     for i, item in enumerate(token_dataset):
         if args.num_prompts is not None and i >= args.num_prompts:
+            logger.info(f"Reached prompt limit ({args.num_prompts}). Stopping.")
             break
             
         token_ids = item["tokens"]
@@ -178,9 +200,9 @@ def main():
         str_tokens = model.to_str_tokens(tokens[0])
         trace_id = hashlib.md5(prompt_str.encode("utf-8")).hexdigest()[:8]
         
-        if args.save_raw_activations:
-            print(f"Prompt {i+1} | Length: {len(token_ids)} | Trace ID: {trace_id}")
-        else:
+        logger.info(f"Processing prompt {i+1} | Length: {len(token_ids)} | Trace ID: {trace_id}")
+        
+        if not args.save_raw_activations:
             # Store case metadata exactly once per prompt
             all_cases.append({
                 "trace_id": trace_id,
@@ -270,9 +292,8 @@ def main():
     if args.save_raw_activations:
         # Flush any remaining items in buffer
         flush_batch()
-        print("--------------------------------------------------")
-        print(f"Execution complete. Total raw activation values saved: {total_elements_written}")
-        print(f"Output directory dataset: {args.raw_activations_dir}")
+        logger.info(f"Execution complete. Total raw activation values saved: {total_elements_written}")
+        logger.info(f"Output directory dataset: {args.raw_activations_dir}")
     else:
         # Save to compressed Parquet files
         if all_events:
@@ -287,7 +308,8 @@ def main():
             cols = ["trace_id", "prompt"]
             pd.DataFrame(columns=cols).to_parquet(args.cases_output, compression="snappy", index=False)
 
-        print(f"Saved relational logs: {args.events_output} and {args.cases_output}")
+        logger.info(f"Saved relational logs: {args.events_output} ({len(all_events)} events) and {args.cases_output} ({len(all_cases)} cases)")
+        logger.info("Execution complete.")
 
 if __name__ == "__main__":
     main()
