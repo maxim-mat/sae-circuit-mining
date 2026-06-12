@@ -92,7 +92,40 @@ def parse_args():
         default=10,
         help="Number of prompts to process before flushing raw activations to disk."
     )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        help="Dataset split to use (e.g. 'train', 'validation', 'test')."
+    )
+    parser.add_argument(
+        "--text_column",
+        type=str,
+        default=None,
+        help="Name of the text column in the dataset. If not set, auto-detects from common names (text, prompt, sentence, content)."
+    )
+    parser.add_argument(
+        "--no_concat",
+        action="store_true",
+        help="Tokenize each prompt individually instead of concatenating into fixed-length windows. Use for short-prompt datasets like mib-bench."
+    )
     return parser.parse_args()
+
+
+def _detect_text_column(dataset, logger):
+    """Auto-detect the text column from a dataset's column names."""
+    columns = dataset.column_names
+    # Ordered by priority
+    candidates = ["text", "prompt", "sentence", "content", "input", "question"]
+    for c in candidates:
+        if c in columns:
+            logger.info(f"Auto-detected text column: '{c}'")
+            return c
+    raise ValueError(
+        f"Could not auto-detect a text column from dataset columns: {columns}. "
+        f"Please specify --text_column explicitly."
+    )
+
 
 def main():
     args = parse_args()
@@ -108,7 +141,15 @@ def main():
     logger.info("Initializing SAE Circuit Mining event generator...")
     logger.info(f"Parameters: release={args.release}, device={args.device}, threshold={args.threshold} ({args.threshold_type}), use_top_k={args.use_top_k}, top_k={args.top_k}")
 
-    # Load models and configurations
+    # --- Load dataset first (before model/SAE) ---
+    logger.info(f"Loading HuggingFace dataset: {args.dataset} (split={args.split})...")
+    dataset = load_dataset(path=args.dataset, split=args.split, streaming=False)
+
+    # Resolve the text column
+    text_column = args.text_column if args.text_column else _detect_text_column(dataset, logger)
+    logger.info(f"Using text column: '{text_column}'")
+
+    # --- Load models and configurations ---
     logger.info(f"Retrieving pre-trained SAE directory map for release: {args.release}...")
     release_saes = get_pretrained_saes_directory()[args.release].saes_map
     
@@ -127,11 +168,31 @@ def main():
     context_size = getattr(list(sae_objects.values())[0].cfg, "context_size", 1024)
     prepend_bos = getattr(list(sae_objects.values())[0].cfg, "prepend_bos", True)
 
-    logger.info(f"Loading HuggingFace dataset: {args.dataset}...")
-    dataset = load_dataset(path=args.dataset, split="train", streaming=False)
-    
-    logger.info("Tokenizing and concatenating dataset...")
-    token_dataset = tokenize_and_concatenate(dataset, model.tokenizer, streaming=True, max_length=context_size, add_bos_token=prepend_bos)
+    # --- Tokenize dataset ---
+    if args.no_concat:
+        # Tokenize each prompt individually (for short-prompt datasets like mib-bench)
+        logger.info("Tokenizing dataset in individual-prompt mode (--no_concat)...")
+        tokenizer = model.tokenizer
+        token_dataset = []
+        for row in dataset:
+            prompt_text = row[text_column]
+            encoding = tokenizer(
+                prompt_text,
+                return_tensors="pt",
+                max_length=context_size,
+                truncation=True,
+                padding=False,
+                add_special_tokens=prepend_bos,
+            )
+            token_dataset.append({"tokens": encoding["input_ids"].squeeze(0)})
+        logger.info(f"Tokenized {len(token_dataset)} individual prompts.")
+    else:
+        logger.info("Tokenizing and concatenating dataset...")
+        token_dataset = tokenize_and_concatenate(
+            dataset, model.tokenizer, streaming=True,
+            max_length=context_size, column_name=text_column,
+            add_bos_token=prepend_bos
+        )
 
     # Trace log (events + cases) is ALWAYS produced
     all_events = []
