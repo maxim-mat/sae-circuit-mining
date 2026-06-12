@@ -133,7 +133,11 @@ def main():
     logger.info("Tokenizing and concatenating dataset...")
     token_dataset = tokenize_and_concatenate(dataset, model.tokenizer, streaming=True, max_length=context_size, add_bos_token=prepend_bos)
 
-    # Global lists to accumulate data for batch writing
+    # Trace log (events + cases) is ALWAYS produced
+    all_events = []
+    all_cases = []
+
+    # Additionally set up raw activations output when enabled
     if args.save_raw_activations:
         # Clear old output directory if it exists
         if os.path.exists(args.raw_activations_dir):
@@ -141,25 +145,21 @@ def main():
             shutil.rmtree(args.raw_activations_dir)
         os.makedirs(args.raw_activations_dir, exist_ok=True)
 
-        # PyArrow Schema for optimized storage & future statistical queries
+        # PyArrow Schema — compact: no string columns, float16 activations
         raw_schema = pa.schema([
             ('prompt_idx', pa.int32()),
-            ('trace_id', pa.string()),
             ('token_idx', pa.int16()),
             ('token_id', pa.int32()),
-            ('token', pa.string()),
             ('feature_idx', pa.int32()),
-            ('activation', pa.float32()),
+            ('activation', pa.float16()),
             ('layer', pa.int16()),
         ])
 
         # Batch accumulator dictionary
         batch_data = {
             'prompt_idx': [],
-            'trace_id': [],
             'token_idx': [],
             'token_id': [],
-            'token': [],
             'feature_idx': [],
             'activation': [],
             'layer': []
@@ -173,17 +173,14 @@ def main():
             pq.write_to_dataset(
                 table, 
                 root_path=args.raw_activations_dir, 
-                partition_cols=['layer'], 
-                use_dictionary=['token', 'trace_id']
+                partition_cols=['layer'],
+                compression='zstd'
             )
             # Clear data
             for k in batch_data:
                 batch_data[k].clear()
 
         total_elements_written = 0
-    else:
-        all_events = []
-        all_cases = []
 
     logger.info("Processing dataset...")
     for i, item in enumerate(token_dataset):
@@ -202,12 +199,11 @@ def main():
         
         logger.info(f"Processing prompt {i+1} | Length: {len(token_ids)} | Trace ID: {trace_id}")
         
-        if not args.save_raw_activations:
-            # Store case metadata exactly once per prompt
-            all_cases.append({
-                "trace_id": trace_id,
-                "prompt": prompt_str
-            })
+        # Store case metadata exactly once per prompt (always)
+        all_cases.append({
+            "trace_id": trace_id,
+            "prompt": prompt_str
+        })
         
         with torch.no_grad():
             logits, cache = model.run_with_cache(tokens)
@@ -219,97 +215,97 @@ def main():
                 acts = cache[hook_point] 
                 feature_acts = sae.encode(acts)[0] 
                 
-                if args.save_raw_activations:
-                    # Raw activations mode: Extract ALL activations > 0.0 without thresholding/top_k
-                    mask = feature_acts > 0.0
-                    passing_indices = mask.nonzero(as_tuple=False)
+                # --- Always produce trace log events ---
+                # Compute relative activation matrix for the event log
+                sum_vals = torch.clamp(feature_acts, min=0.0).sum(dim=1, keepdim=True)
+                sum_vals[sum_vals == 0] = 1.0
+                rel_activation_matrix = feature_acts / sum_vals
+
+                # Determine which matrix to use for thresholding
+                if args.threshold_type == "relative":
+                    activation_matrix = rel_activation_matrix
+                else:
+                    activation_matrix = feature_acts
+                
+                mask = activation_matrix >= args.threshold
+                
+                # If top-k is also enabled, further restrict the mask
+                if args.use_top_k:
+                    k = min(args.top_k, activation_matrix.shape[1])
+                    _, topk_indices = torch.topk(activation_matrix, k=k, dim=1)
                     
-                    if passing_indices.numel() > 0:
-                        token_indices = passing_indices[:, 0]
-                        feature_indices = passing_indices[:, 1]
+                    topk_mask = torch.zeros_like(activation_matrix, dtype=torch.bool)
+                    topk_mask.scatter_(1, topk_indices, True)
+                    
+                    mask = mask & topk_mask
+                
+                passing_indices = mask.nonzero(as_tuple=False)
+                
+                for t, idx in passing_indices:
+                    t_val = t.item()
+                    idx_val = idx.item()
+                    
+                    # Lean event row: completely omits the prompt string
+                    all_events.append({
+                        "trace_id": trace_id,
+                        "timestamp": layer_idx,
+                        "activity": f"L{layer_idx}_{idx_val}",
+                        "token_idx": t_val,
+                        "token": str_tokens[t_val],
+                        "relative_activation_value": rel_activation_matrix[t_val, idx_val].item(),
+                        "absolute_activation_value": feature_acts[t_val, idx_val].item()
+                    })
+
+                # --- Additionally save raw activations if enabled ---
+                if args.save_raw_activations:
+                    raw_mask = feature_acts > 0.0
+                    raw_passing = raw_mask.nonzero(as_tuple=False)
+                    
+                    if raw_passing.numel() > 0:
+                        token_indices = raw_passing[:, 0]
+                        feature_indices = raw_passing[:, 1]
                         vals = feature_acts[token_indices, feature_indices]
                         
                         # Move to CPU / NumPy
                         token_indices_cpu = token_indices.cpu().numpy()
                         feature_indices_cpu = feature_indices.cpu().numpy()
-                        vals_cpu = vals.cpu().numpy()
+                        vals_cpu = vals.cpu().half().numpy()  # float16 for size reduction
                         
                         num_events = len(token_indices_cpu)
                         total_elements_written += num_events
                         
                         batch_data['prompt_idx'].extend([i] * num_events)
-                        batch_data['trace_id'].extend([trace_id] * num_events)
                         batch_data['token_idx'].extend(token_indices_cpu.tolist())
                         batch_data['token_id'].extend([token_ids[t].item() for t in token_indices_cpu])
-                        batch_data['token'].extend([str_tokens[t] for t in token_indices_cpu])
                         batch_data['feature_idx'].extend(feature_indices_cpu.tolist())
                         batch_data['activation'].extend(vals_cpu.tolist())
                         batch_data['layer'].extend([layer_idx] * num_events)
-                else:
-                    sum_vals = torch.clamp(feature_acts, min=0.0).sum(dim=1, keepdim=True)
-                    sum_vals[sum_vals == 0] = 1.0
-                    rel_activation_matrix = feature_acts / sum_vals
-                    
-                    # Determine which matrix to use for thresholding
-                    if args.threshold_type == "relative":
-                        activation_matrix = rel_activation_matrix
-                    else:
-                        activation_matrix = feature_acts
-                    
-                    # We require that the activation is >= threshold and the feature is active (> 0)
-                    mask = (activation_matrix >= args.threshold) & (feature_acts > 0.0)
-                    
-                    # If top-k is also enabled, further restrict the mask
-                    if args.use_top_k:
-                        k = min(args.top_k, activation_matrix.shape[1])
-                        _, topk_indices = torch.topk(activation_matrix, k=k, dim=1)
-                        
-                        topk_mask = torch.zeros_like(activation_matrix, dtype=torch.bool)
-                        topk_mask.scatter_(1, topk_indices, True)
-                        
-                        mask = mask & topk_mask
-                    
-                    passing_indices = mask.nonzero(as_tuple=False)
-                    
-                    for t, idx in passing_indices:
-                        t_val = t.item()
-                        idx_val = idx.item()
-                        
-                        # Lean event row: completely omits the prompt string
-                        all_events.append({
-                            "trace_id": trace_id,
-                            "timestamp": layer_idx,
-                            "activity": f"L{layer_idx}_{idx_val}",
-                            "token_idx": t_val,
-                            "token": str_tokens[t_val],
-                            "relative_activation_value": rel_activation_matrix[t_val, idx_val].item(),
-                            "absolute_activation_value": feature_acts[t_val, idx_val].item()
-                        })
 
         if args.save_raw_activations and (i + 1) % args.chunk_size == 0:
             flush_batch()
 
-    if args.save_raw_activations:
-        # Flush any remaining items in buffer
-        flush_batch()
-        logger.info(f"Execution complete. Total raw activation values saved: {total_elements_written}")
-        logger.info(f"Output directory dataset: {args.raw_activations_dir}")
+    # Always save trace logs (events + cases)
+    if all_events:
+        pd.DataFrame(all_events).to_parquet(args.events_output, compression="snappy", index=False)
     else:
-        # Save to compressed Parquet files
-        if all_events:
-            pd.DataFrame(all_events).to_parquet(args.events_output, compression="snappy", index=False)
-        else:
-            cols = ["trace_id", "timestamp", "activity", "token_idx", "token", "relative_activation_value", "absolute_activation_value"]
-            pd.DataFrame(columns=cols).to_parquet(args.events_output, compression="snappy", index=False)
+        cols = ["trace_id", "timestamp", "activity", "token_idx", "token", "relative_activation_value", "absolute_activation_value"]
+        pd.DataFrame(columns=cols).to_parquet(args.events_output, compression="snappy", index=False)
 
-        if all_cases:
-            pd.DataFrame(all_cases).to_parquet(args.cases_output, compression="snappy", index=False)
-        else:
-            cols = ["trace_id", "prompt"]
-            pd.DataFrame(columns=cols).to_parquet(args.cases_output, compression="snappy", index=False)
+    if all_cases:
+        pd.DataFrame(all_cases).to_parquet(args.cases_output, compression="snappy", index=False)
+    else:
+        cols = ["trace_id", "prompt"]
+        pd.DataFrame(columns=cols).to_parquet(args.cases_output, compression="snappy", index=False)
 
-        logger.info(f"Saved relational logs: {args.events_output} ({len(all_events)} events) and {args.cases_output} ({len(all_cases)} cases)")
-        logger.info("Execution complete.")
+    logger.info(f"Saved trace logs: {args.events_output} ({len(all_events)} events) and {args.cases_output} ({len(all_cases)} cases)")
+
+    # Additionally finalize raw activations if enabled
+    if args.save_raw_activations:
+        flush_batch()
+        logger.info(f"Raw activation values saved: {total_elements_written} total")
+        logger.info(f"Output directory dataset: {args.raw_activations_dir}")
+
+    logger.info("Execution complete.")
 
 if __name__ == "__main__":
     main()
