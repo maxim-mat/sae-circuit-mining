@@ -174,6 +174,7 @@ def main():
 
         # PyArrow Schema — compact: no string columns, float16 activations
         raw_schema = pa.schema([
+            ('counterfactual', pa.string()),
             ('prompt_idx', pa.int32()),
             ('token_idx', pa.int16()),
             ('token_id', pa.int32()),
@@ -184,6 +185,7 @@ def main():
 
         # Batch accumulator dictionary
         batch_data = {
+            'counterfactual': [],
             'prompt_idx': [],
             'token_idx': [],
             'token_id': [],
@@ -200,7 +202,7 @@ def main():
             pq.write_to_dataset(
                 table, 
                 root_path=args.attributions_dir, 
-                partition_cols=['layer'],
+                partition_cols=['counterfactual', 'layer'],
                 compression='zstd'
             )
             # Clear data
@@ -210,8 +212,8 @@ def main():
         total_elements_written = 0
 
     logger.info("Processing dataset...")
-    for i, item in enumerate(token_dataset):
-        if args.num_prompts is not None and i >= args.num_prompts:
+    for p_idx, item in enumerate(token_dataset):
+        if args.num_prompts is not None and p_idx >= args.num_prompts:
             logger.info(f"Reached prompt limit ({args.num_prompts}). Stopping.")
             break
             
@@ -221,15 +223,9 @@ def main():
         tokens = token_ids.unsqueeze(0).to(args.device)
         
         prompt_str = model.to_string(tokens[0])
-        str_tokens = model.to_str_tokens(tokens[0])
         trace_id = hashlib.md5(prompt_str.encode("utf-8")).hexdigest()[:8]
         
-        logger.info(f"Processing prompt {i+1} | Length: {len(token_ids)} | Trace ID: {trace_id}")
-        
-
-        
-        # We need gradients, so clear them first
-        model.zero_grad()
+        logger.info(f"Processing prompt {p_idx+1} | Length: {len(token_ids)} | Trace ID: {trace_id}")
         
         acts_dict = {}
         def make_fwd_hook(hook_name):
@@ -244,80 +240,90 @@ def main():
             
         logits = model(tokens)
         
-        metric_kwargs = {
-            'logits': logits,
-            'tokens': tokens,
-            'item': item,
-        }
-        
-        # If the dataset provides correct and corrupted tokens (e.g., for IOI)
-        if 'correct_token_id' in item and 'corrupted_token_id' in item:
-            pos = item.get('target_position', -1)
-            correct_idx = item['correct_token_id']
-            corrupt_idx = item['corrupted_token_id']
+        # Find all counterfactuals in the item
+        counterfactuals = {}
+        if 'choices' in item and 'answerKey' in item:
+            counterfactuals['clean'] = item
             
-            if isinstance(pos, torch.Tensor): pos = pos.item()
-            if isinstance(correct_idx, torch.Tensor): correct_idx = correct_idx.item()
-            if isinstance(corrupt_idx, torch.Tensor): corrupt_idx = corrupt_idx.item()
-            
-            metric_kwargs['correct_logits'] = logits[0, pos, correct_idx]
-            metric_kwargs['corrupted_logits'] = logits[0, pos, corrupt_idx]
-            
-        metric_tensor, direction = metric_fn(**metric_kwargs)
-        metric_tensor.backward()
-        
-        for sid, hook_point in sorted_sae_items:
-            layer_idx = int(sid.split('.')[1])
-            sae = sae_objects[sid]
-            
-            acts = acts_dict[hook_point] # shape: [1, seq_len, d_model]
-            grad_acts = acts.grad[0]     # shape: [seq_len, d_model]
-            acts_0 = acts[0]             # shape: [seq_len, d_model]
-            
-            # encode to get feature activations
-            feature_acts = sae.encode(acts_0.unsqueeze(0))[0] # shape: [seq_len, d_sae]
-            
-            # W_dec transpose handling
-            if sae.W_dec.shape[0] == sae.cfg.d_sae:
-                W_dec_T = sae.W_dec.T
-            else:
-                W_dec_T = sae.W_dec
-                
-            # grad_f = grad_x @ W_dec^T
-            grad_f = torch.matmul(grad_acts, W_dec_T)
-            
-            # zero-ablation attribution = direction * grad_f * feature_acts
-            # Helpful features will have positive attribution scores.
-            attributions = direction * grad_f * feature_acts
-            
-            if args.save_attributions:
-                # We filter by feature_acts > 0, so attributions can be positive or negative
-                raw_mask = feature_acts > 0.0
-                raw_passing = raw_mask.nonzero(as_tuple=False)
-                
-                if raw_passing.numel() > 0:
-                    token_indices = raw_passing[:, 0]
-                    feature_indices = raw_passing[:, 1]
-                    vals = attributions[token_indices, feature_indices]
-                    
-                    # Move to CPU / NumPy
-                    token_indices_cpu = token_indices.cpu().numpy()
-                    feature_indices_cpu = feature_indices.cpu().numpy()
-                    vals_cpu = vals.cpu().detach().to(torch.float16).numpy()  # float16 for size reduction
-                    
-                    num_events = len(token_indices_cpu)
-                    total_elements_written += num_events
-                    
-                    batch_data['prompt_idx'].extend([i] * num_events)
-                    batch_data['token_idx'].extend(token_indices_cpu.tolist())
-                    batch_data['token_id'].extend([token_ids[t].item() for t in token_indices_cpu])
-                    batch_data['feature_idx'].extend(feature_indices_cpu.tolist())
-                    batch_data['attribution'].extend(vals_cpu.tolist())
-                    batch_data['layer'].extend([layer_idx] * num_events)
-                    
-        model.reset_hooks()
+        for key, value in item.items():
+            if isinstance(value, dict) and 'choices' in value and 'answerKey' in value:
+                counterfactuals[key] = value
 
-        if args.save_attributions and (i + 1) % args.chunk_size == 0:
+        if not counterfactuals:
+            # Fallback for standard datasets without counterfactuals
+            counterfactuals['default'] = item
+
+        for cf_name, cf_item in counterfactuals.items():
+            model.zero_grad()
+            for hook_point in acts_dict:
+                if acts_dict[hook_point].grad is not None:
+                    acts_dict[hook_point].grad.zero_()
+            
+            metric_kwargs = {
+                'logits': logits,
+                'tokens': tokens,
+                'item': cf_item,
+                'model': model
+            }
+            
+            metric_tensor, direction = metric_fn(**metric_kwargs)
+            metric_tensor.backward(retain_graph=True)
+            
+            for sid, hook_point in sorted_sae_items:
+                layer_idx = int(sid.split('.')[1])
+                sae = sae_objects[sid]
+                
+                acts = acts_dict[hook_point] # shape: [1, seq_len, d_model]
+                grad_acts = acts.grad[0]     # shape: [seq_len, d_model]
+                acts_0 = acts[0]             # shape: [seq_len, d_model]
+                
+                # encode to get feature activations
+                feature_acts = sae.encode(acts_0.unsqueeze(0))[0] # shape: [seq_len, d_sae]
+                
+                # W_dec transpose handling
+                if sae.W_dec.shape[0] == sae.cfg.d_sae:
+                    W_dec_T = sae.W_dec.T
+                else:
+                    W_dec_T = sae.W_dec
+                    
+                # grad_f = grad_x @ W_dec^T
+                grad_f = torch.matmul(grad_acts, W_dec_T)
+                
+                # zero-ablation attribution = direction * grad_f * feature_acts
+                # Helpful features will have positive attribution scores.
+                attributions = direction * grad_f * feature_acts
+                
+                if args.save_attributions:
+                    # We filter by feature_acts > 0, so attributions can be positive or negative
+                    raw_mask = feature_acts > 0.0
+                    raw_passing = raw_mask.nonzero(as_tuple=False)
+                    
+                    if raw_passing.numel() > 0:
+                        token_indices = raw_passing[:, 0]
+                        feature_indices = raw_passing[:, 1]
+                        vals = attributions[token_indices, feature_indices]
+                        
+                        # Move to CPU / NumPy
+                        token_indices_cpu = token_indices.cpu().numpy()
+                        feature_indices_cpu = feature_indices.cpu().numpy()
+                        vals_cpu = vals.cpu().detach().to(torch.float16).numpy()  # float16 for size reduction
+                        
+                        num_events = len(token_indices_cpu)
+                        total_elements_written += num_events
+                        
+                        batch_data['counterfactual'].extend([cf_name] * num_events)
+                        batch_data['prompt_idx'].extend([p_idx] * num_events)
+                        batch_data['token_idx'].extend(token_indices_cpu.tolist())
+                        batch_data['token_id'].extend([token_ids[t].item() for t in token_indices_cpu])
+                        batch_data['feature_idx'].extend(feature_indices_cpu.tolist())
+                        batch_data['attribution'].extend(vals_cpu.tolist())
+                        batch_data['layer'].extend([layer_idx] * num_events)
+                        
+        model.reset_hooks()
+        # acts_dict is captured by reference, clear it for the next prompt
+        acts_dict.clear()
+
+        if args.save_attributions and (p_idx + 1) % args.chunk_size == 0:
             flush_batch()
 
     # Finalize attributions if enabled

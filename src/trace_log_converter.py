@@ -44,14 +44,14 @@ def discretize_causal_log(parquet_path, mass_threshold=0.90):
     
     # Sort to ensure highest causal drivers are at the top of each token/layer group
     df = df.sort_values(
-        ['prompt_idx', 'token_idx', 'layer', 'abs_attr'], 
-        ascending=[True, True, True, False]
+        ['counterfactual', 'prompt_idx', 'token_idx', 'layer', 'abs_attr'], 
+        ascending=[True, True, True, True, False]
     )
     
     print("Calculating cumulative causal mass...")
     # Calculate relative mass contribution per token per layer
-    df['total_group_mass'] = df.groupby(['prompt_idx', 'token_idx', 'layer'])['abs_attr'].transform('sum')
-    df['cumulative_mass'] = df.groupby(['prompt_idx', 'token_idx', 'layer'])['abs_attr'].cumsum()
+    df['total_group_mass'] = df.groupby(['counterfactual', 'prompt_idx', 'token_idx', 'layer'])['abs_attr'].transform('sum')
+    df['cumulative_mass'] = df.groupby(['counterfactual', 'prompt_idx', 'token_idx', 'layer'])['abs_attr'].cumsum()
     
     df['mass_ratio'] = df['cumulative_mass'] / (df['total_group_mass'] + 1e-9)
     
