@@ -214,88 +214,88 @@ def main():
     logger.info("Processing dataset...")
     for p_idx, item in enumerate(token_dataset):
         if args.num_prompts is not None and p_idx >= args.num_prompts:
-            logger.info(f"Reached prompt limit ({args.num_prompts}). Stopping.")
             break
             
-        token_ids = item["tokens"]
-        if not isinstance(token_ids, torch.Tensor):
-            token_ids = torch.tensor(token_ids)
-        tokens = token_ids.unsqueeze(0).to(args.device)
+        clean_token_ids = item["tokens"]
+        if not isinstance(clean_token_ids, torch.Tensor):
+            clean_token_ids = torch.tensor(clean_token_ids)
+        clean_tokens = clean_token_ids.unsqueeze(0).to(args.device)
         
-        prompt_str = model.to_string(tokens[0])
-        trace_id = hashlib.md5(prompt_str.encode("utf-8")).hexdigest()[:8]
+        model.zero_grad()
+        acts_dict_clean = {}
         
-        logger.info(f"Processing prompt {p_idx+1} | Length: {len(token_ids)} | Trace ID: {trace_id}")
-        
-        acts_dict = {}
-        def make_fwd_hook(hook_name):
+        def make_fwd_hook(hook_name, target_dict):
             def fwd_hook(tensor, hook):
-                tensor.retain_grad()
-                acts_dict[hook_name] = tensor
+                if target_dict is acts_dict_clean:
+                    tensor.retain_grad()
+                target_dict[hook_name] = tensor
                 return tensor
             return fwd_hook
             
         for sid, hook_point in sorted_sae_items:
-            model.add_hook(hook_point, make_fwd_hook(hook_point), dir='fwd')
+            model.add_hook(hook_point, make_fwd_hook(hook_point, acts_dict_clean), dir='fwd')
             
-        logits = model(tokens)
+        clean_logits = model(clean_tokens)
         
-        # Find all counterfactuals in the item
-        counterfactuals = {}
-        if 'choices' in item and 'answerKey' in item:
-            counterfactuals['clean'] = item
-            
-        for key, value in item.items():
-            if isinstance(value, dict) and 'choices' in value and 'answerKey' in value:
-                counterfactuals[key] = value
+        metric_kwargs = {
+            'logits': clean_logits,
+            'tokens': clean_tokens,
+            'item': item, 
+            'model': model
+        }
+        metric_tensor, direction = metric_fn(**metric_kwargs)
+        metric_tensor.backward(retain_graph=True)
+        
+        model.reset_hooks()
 
-        if not counterfactuals:
-            # Fallback for standard datasets without counterfactuals
-            counterfactuals['default'] = item
+        counterfactuals = {k: v for k, v in item.items() if isinstance(v, dict) and 'prompt' in v}
 
         for cf_name, cf_item in counterfactuals.items():
-            model.zero_grad()
-            for hook_point in acts_dict:
-                if acts_dict[hook_point].grad is not None:
-                    acts_dict[hook_point].grad.zero_()
             
-            metric_kwargs = {
-                'logits': logits,
-                'tokens': tokens,
-                'item': cf_item,
-                'model': model
-            }
-            
-            metric_tensor, direction = metric_fn(**metric_kwargs)
-            metric_tensor.backward(retain_graph=True)
+            cf_text = cf_item['prompt']
+            cf_encoding = model.tokenizer(
+                cf_text,
+                return_tensors="pt",
+                max_length=context_size,
+                truncation=True,
+                padding=False,
+                add_special_tokens=prepend_bos,
+            )
+            cf_tokens = cf_encoding["input_ids"].to(args.device)
+
+            acts_dict_cf = {}
+            for sid, hook_point in sorted_sae_items:
+                model.add_hook(hook_point, make_fwd_hook(hook_point, acts_dict_cf), dir='fwd')
+                
+            with torch.no_grad():
+                model(cf_tokens)
+                
+            model.reset_hooks()
             
             for sid, hook_point in sorted_sae_items:
                 layer_idx = int(sid.split('.')[1])
                 sae = sae_objects[sid]
                 
-                acts = acts_dict[hook_point] # shape: [1, seq_len, d_model]
-                grad_acts = acts.grad[0]     # shape: [seq_len, d_model]
-                acts_0 = acts[0]             # shape: [seq_len, d_model]
+                acts_clean = acts_dict_clean[hook_point][0]
+                acts_cf = acts_dict_cf[hook_point][0]
+                grad_acts = acts_dict_clean[hook_point].grad[0]
                 
-                # encode to get feature activations
-                feature_acts = sae.encode(acts_0.unsqueeze(0))[0] # shape: [seq_len, d_sae]
+                # Truncate to the minimum sequence length to align positional activations
+                seq_len = min(acts_clean.shape[0], acts_cf.shape[0])
+                acts_clean = acts_clean[:seq_len]
+                acts_cf = acts_cf[:seq_len]
+                grad_acts = grad_acts[:seq_len]
                 
-                # W_dec transpose handling
-                if sae.W_dec.shape[0] == sae.cfg.d_sae:
-                    W_dec_T = sae.W_dec.T
-                else:
-                    W_dec_T = sae.W_dec
-                    
-                # grad_f = grad_x @ W_dec^T
+                f_clean = sae.encode(acts_clean.unsqueeze(0))[0]
+                f_corrupt = sae.encode(acts_cf.unsqueeze(0))[0]
+                
+                W_dec_T = sae.W_dec.T if sae.W_dec.shape[0] == sae.cfg.d_sae else sae.W_dec
                 grad_f = torch.matmul(grad_acts, W_dec_T)
                 
-                # zero-ablation attribution = direction * grad_f * feature_acts
-                # Helpful features will have positive attribution scores.
-                attributions = direction * grad_f * feature_acts
+                attributions = direction * grad_f * (f_corrupt - f_clean)
                 
                 if args.save_attributions:
-                    # We filter by feature_acts > 0, so attributions can be positive or negative
-                    raw_mask = feature_acts > 0.0
+                    raw_mask = (f_clean > 0.0) | (f_corrupt > 0.0)
                     raw_passing = raw_mask.nonzero(as_tuple=False)
                     
                     if raw_passing.numel() > 0:
@@ -303,10 +303,9 @@ def main():
                         feature_indices = raw_passing[:, 1]
                         vals = attributions[token_indices, feature_indices]
                         
-                        # Move to CPU / NumPy
                         token_indices_cpu = token_indices.cpu().numpy()
                         feature_indices_cpu = feature_indices.cpu().numpy()
-                        vals_cpu = vals.cpu().detach().to(torch.float16).numpy()  # float16 for size reduction
+                        vals_cpu = vals.cpu().detach().to(torch.float16).numpy()
                         
                         num_events = len(token_indices_cpu)
                         total_elements_written += num_events
@@ -314,14 +313,15 @@ def main():
                         batch_data['counterfactual'].extend([cf_name] * num_events)
                         batch_data['prompt_idx'].extend([p_idx] * num_events)
                         batch_data['token_idx'].extend(token_indices_cpu.tolist())
-                        batch_data['token_id'].extend([token_ids[t].item() for t in token_indices_cpu])
+                        batch_data['token_id'].extend([clean_token_ids[t].item() for t in token_indices_cpu])
                         batch_data['feature_idx'].extend(feature_indices_cpu.tolist())
                         batch_data['attribution'].extend(vals_cpu.tolist())
                         batch_data['layer'].extend([layer_idx] * num_events)
                         
-        model.reset_hooks()
-        # acts_dict is captured by reference, clear it for the next prompt
-        acts_dict.clear()
+        for hook_point in acts_dict_clean:
+            if acts_dict_clean[hook_point].grad is not None:
+                acts_dict_clean[hook_point].grad.zero_()
+        acts_dict_clean.clear()
 
         if args.save_attributions and (p_idx + 1) % args.chunk_size == 0:
             flush_batch()
