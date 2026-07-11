@@ -74,6 +74,19 @@ def parse_args():
         action="store_true",
         help="Tokenize each prompt individually instead of concatenating into fixed-length windows. Use for short-prompt datasets like mib-bench."
     )
+    parser.add_argument(
+        "--attribution_method",
+        type=str,
+        default="attrib",
+        choices=["attrib", "ig"],
+        help="Node attribution method: 'attrib' = first-order attribution patching (gradient at the clean point); 'ig' = integrated gradients along the clean->counterfactual path (Marks et al. 2024). ig is slower but more accurate for early layers / large activation deltas."
+    )
+    parser.add_argument(
+        "--ig_steps",
+        type=int,
+        default=10,
+        help="Number of interpolation steps for --attribution_method ig. Ignored for 'attrib'. ig_steps=1 reduces exactly to attribution patching."
+    )
     return parser.parse_args()
 
 
@@ -90,6 +103,43 @@ def _detect_text_column(dataset, logger):
         f"Could not auto-detect a text column from dataset columns: {columns}. "
         f"Please specify --text_column explicitly."
     )
+
+
+def integrated_gradient_grad_x(model, clean_tokens, hook_point, acts_clean, acts_cf,
+                               metric_fn, item, steps):
+    """Mean residual-stream gradient of the metric along the clean->counterfactual
+    interpolation path at one hook point.
+
+    Integrated-gradients node attribution, following the reference implementation
+    _pe_ig in Marks et al. 2024, "Sparse Feature Circuits" (arXiv:2403.19647):
+    only this hook's activation is interpolated, so all other layers see the clean
+    input. The interpolated activation is (1-a)*acts_clean + a*acts_cf for
+    a = step/steps, step in [0, steps); this is exactly decode(interp features) +
+    interp residual because decode is affine and coefficients sum to 1, so the
+    residual-stream gradient projected by W_dec.T / read directly recovers the
+    feature / error gradients. The `steps` points are batched into one pass.
+
+    Returns [seq, d_model]; steps=1 reduces to attribution patching (gradient at
+    the clean point).
+    """
+    alphas = torch.arange(steps, device=clean_tokens.device, dtype=acts_clean.dtype) / steps
+    x_interp = acts_clean.unsqueeze(0) + alphas.view(-1, 1, 1) * (acts_cf - acts_clean).unsqueeze(0)
+    x_interp = x_interp.detach().requires_grad_()  # [steps, seq, d_model] leaf
+
+    def ig_hook(tensor, hook):
+        return x_interp
+
+    logits = model.run_with_hooks(
+        clean_tokens.repeat(steps, 1), fwd_hooks=[(hook_point, ig_hook)]
+    )
+    # Sum per-step metrics: d(sum)/dx_interp[i] isolates the gradient at alpha_i.
+    total_metric = 0
+    for i in range(steps):
+        m_i, _ = metric_fn(logits=logits[i:i+1], tokens=clean_tokens, item=item, model=model)
+        total_metric = total_metric + m_i
+    model.zero_grad(set_to_none=True)
+    total_metric.backward()
+    return x_interp.grad.mean(dim=0)  # [seq, d_model]
 
 
 def main():
@@ -246,7 +296,10 @@ def main():
             'model': model
         }
         metric_tensor, direction = metric_fn(**metric_kwargs)
-        metric_tensor.backward()
+        # 'ig' recomputes gradients along an interpolation path per layer, so it
+        # does not use the clean-point gradient.
+        if args.attribution_method == "attrib":
+            metric_tensor.backward()
 
         model.reset_hooks()
 
@@ -282,11 +335,19 @@ def main():
                 
                 acts_clean = acts_dict_clean[hook_point][0]
                 acts_cf = acts_dict_cf[hook_point][0]
-                grad_acts = acts_dict_clean[hook_point].grad[0]
 
                 f_clean = sae.encode(acts_clean.unsqueeze(0))[0]
                 f_corrupt = sae.encode(acts_cf.unsqueeze(0))[0]
-                
+
+                # Residual-stream gradient of the metric at this hook point.
+                if args.attribution_method == "ig":
+                    grad_acts = integrated_gradient_grad_x(
+                        model, clean_tokens, hook_point, acts_clean, acts_cf,
+                        metric_fn, item, args.ig_steps
+                    )
+                else:
+                    grad_acts = acts_dict_clean[hook_point].grad[0]
+
                 W_dec_T = sae.W_dec.T if sae.W_dec.shape[0] == sae.cfg.d_sae else sae.W_dec
                 grad_f = torch.matmul(grad_acts, W_dec_T)
                 
