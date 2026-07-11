@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument(
         "--save_attributions",
         action="store_true",
-        help="If set, creates a dataset of zero-ablation attributions optimized for future global statistical analysis."
+        help="If set, saves counterfactual (activation-patching) attributions per SAE feature and per SAE error node to a partitioned Parquet dataset. Requires a dataset with counterfactual columns (e.g. MIB-bench)."
     )
     parser.add_argument(
         "--attributions_dir",
@@ -140,20 +140,15 @@ def main():
     if args.no_concat:
         # Tokenize each prompt individually (for short-prompt datasets like mib-bench)
         logger.info("Tokenizing dataset in individual-prompt mode (--no_concat)...")
-        tokenizer = model.tokenizer
         token_dataset = []
         for row in dataset:
-            prompt_text = row[text_column]
-            encoding = tokenizer(
-                prompt_text,
-                return_tensors="pt",
-                max_length=context_size,
-                truncation=True,
-                padding=False,
-                add_special_tokens=prepend_bos,
-            )
             new_row = row.copy()
-            new_row["tokens"] = encoding["input_ids"].squeeze(0)
+            # model.to_tokens honors prepend_bos; the raw tokenizer's
+            # add_special_tokens is a no-op for GPT-2, which never inserts a BOS,
+            # leaving position 0 off-distribution for the SAEs.
+            new_row["tokens"] = model.to_tokens(
+                row[text_column], prepend_bos=prepend_bos
+            ).squeeze(0)
             token_dataset.append(new_row)
         logger.info(f"Tokenized {len(token_dataset)} individual prompts.")
     else:
@@ -215,7 +210,14 @@ def main():
     for p_idx, item in enumerate(token_dataset):
         if args.num_prompts is not None and p_idx >= args.num_prompts:
             break
-            
+
+        # Counterfactual patching is this script's only output; without patch
+        # pairs (or without --save_attributions) the per-prompt forward/backward
+        # produces nothing, so skip before doing any work.
+        counterfactuals = {k: v for k, v in item.items() if isinstance(v, dict) and 'prompt' in v}
+        if not args.save_attributions or not counterfactuals:
+            continue
+
         clean_token_ids = item["tokens"]
         if not isinstance(clean_token_ids, torch.Tensor):
             clean_token_ids = torch.tensor(clean_token_ids)
@@ -244,24 +246,26 @@ def main():
             'model': model
         }
         metric_tensor, direction = metric_fn(**metric_kwargs)
-        metric_tensor.backward(retain_graph=True)
-        
-        model.reset_hooks()
+        metric_tensor.backward()
 
-        counterfactuals = {k: v for k, v in item.items() if isinstance(v, dict) and 'prompt' in v}
+        model.reset_hooks()
 
         for cf_name, cf_item in counterfactuals.items():
             
             cf_text = cf_item['prompt']
-            cf_encoding = model.tokenizer(
-                cf_text,
-                return_tensors="pt",
-                max_length=context_size,
-                truncation=True,
-                padding=False,
-                add_special_tokens=prepend_bos,
-            )
-            cf_tokens = cf_encoding["input_ids"].to(args.device)
+            # to_tokens honors prepend_bos (see the clean-side note above).
+            cf_tokens = model.to_tokens(cf_text, prepend_bos=prepend_bos).to(args.device)
+
+            # Counterfactual patching requires clean/CF positions to correspond.
+            # MIB pairs are length-matched by design; if BPE makes them differ,
+            # positions misalign and the metric-bearing final position would be
+            # silently dropped, so skip this pair rather than emit corrupt data.
+            if cf_tokens.shape[1] != clean_tokens.shape[1]:
+                logger.warning(
+                    f"Prompt {p_idx} counterfactual '{cf_name}': token-length mismatch "
+                    f"(clean={clean_tokens.shape[1]}, cf={cf_tokens.shape[1]}); skipping pair."
+                )
+                continue
 
             acts_dict_cf = {}
             for sid, hook_point in sorted_sae_items:
@@ -279,13 +283,7 @@ def main():
                 acts_clean = acts_dict_clean[hook_point][0]
                 acts_cf = acts_dict_cf[hook_point][0]
                 grad_acts = acts_dict_clean[hook_point].grad[0]
-                
-                # Truncate to the minimum sequence length to align positional activations
-                seq_len = min(acts_clean.shape[0], acts_cf.shape[0])
-                acts_clean = acts_clean[:seq_len]
-                acts_cf = acts_cf[:seq_len]
-                grad_acts = grad_acts[:seq_len]
-                
+
                 f_clean = sae.encode(acts_clean.unsqueeze(0))[0]
                 f_corrupt = sae.encode(acts_cf.unsqueeze(0))[0]
                 
@@ -317,7 +315,27 @@ def main():
                         batch_data['feature_idx'].extend(feature_indices_cpu.tolist())
                         batch_data['attribution'].extend(vals_cpu.tolist())
                         batch_data['layer'].extend([layer_idx] * num_events)
-                        
+
+                    # SAE reconstruction-error node (Marks et al. 2024, arXiv:2403.19647):
+                    # the residual not captured by any feature. Stored with
+                    # feature_idx = -1 so a layer's feature attributions plus the
+                    # error attribution sum to the residual-stream IE. Dense by
+                    # nature: one value per token.
+                    err_clean = acts_clean - sae.decode(f_clean.unsqueeze(0))[0]
+                    err_cf = acts_cf - sae.decode(f_corrupt.unsqueeze(0))[0]
+                    err_attr = direction * (grad_acts * (err_cf - err_clean)).sum(dim=-1)
+                    err_cpu = err_attr.cpu().detach().to(torch.float16).numpy()
+                    n_err = len(err_cpu)
+                    total_elements_written += n_err
+
+                    batch_data['counterfactual'].extend([cf_name] * n_err)
+                    batch_data['prompt_idx'].extend([p_idx] * n_err)
+                    batch_data['token_idx'].extend(range(n_err))
+                    batch_data['token_id'].extend([clean_token_ids[t].item() for t in range(n_err)])
+                    batch_data['feature_idx'].extend([-1] * n_err)
+                    batch_data['attribution'].extend(err_cpu.tolist())
+                    batch_data['layer'].extend([layer_idx] * n_err)
+
         for hook_point in acts_dict_clean:
             if acts_dict_clean[hook_point].grad is not None:
                 acts_dict_clean[hook_point].grad.zero_()
@@ -329,6 +347,12 @@ def main():
     # Finalize attributions if enabled
     if args.save_attributions:
         flush_batch()
+        if total_elements_written == 0:
+            logger.warning(
+                "No attributions written: no counterfactuals found. Counterfactual "
+                "patching needs items with nested dict columns containing a 'prompt' key "
+                "(e.g. MIB-bench with --no_concat); datasets like pile-10k have none."
+            )
         logger.info(f"Attribution values saved: {total_elements_written} total")
         logger.info(f"Output directory dataset: {args.attributions_dir}")
 

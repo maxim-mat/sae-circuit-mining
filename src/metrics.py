@@ -39,13 +39,29 @@ def mib_bench_logit_diff_metric(logits, item, model, **kwargs):
         
     choices = item['choices']
     answer_key = item['answerKey']
-    
+
+    if len(choices) != 2:
+        raise ValueError(
+            f"mib_bench_logit_diff_metric expects exactly 2 choices, got {len(choices)}."
+        )
+    if answer_key not in (0, 1):
+        raise ValueError(
+            f"mib_bench_logit_diff_metric expects answerKey in {{0, 1}}, got {answer_key!r}."
+        )
+
     correct_str = choices[answer_key]
     corrupted_str = choices[1 - answer_key]
-    
-    # Tokenize (assuming standard leading space for names in GPT-2)
-    correct_token = model.to_single_token(" " + correct_str)
-    corrupted_token = model.to_single_token(" " + corrupted_str)
+
+    # Logit diff is read at a single position, so answers must be single tokens.
+    # (assuming standard leading space for names in GPT-2)
+    try:
+        correct_token = model.to_single_token(" " + correct_str)
+        corrupted_token = model.to_single_token(" " + corrupted_str)
+    except Exception as e:
+        raise ValueError(
+            f"mib_bench_logit_diff_metric requires single-token answers; "
+            f"'{correct_str}' / '{corrupted_str}' do not each map to one GPT-2 token."
+        ) from e
     
     # Usually logit diff is measured at the last position of the prompt
     pos = -1
