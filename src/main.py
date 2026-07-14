@@ -224,7 +224,7 @@ def main():
             ('token_idx', pa.int16()),
             ('token_id', pa.int32()),
             ('feature_idx', pa.int32()),
-            ('attribution', pa.float16()),
+            ('attribution', pa.float32()),
             ('layer', pa.int16()),
         ])
 
