@@ -117,7 +117,8 @@ ORDERINGS = {
 def load_attributions(path, counterfactual=None):
     """Load the partitioned attribution dataset written by main.py.
 
-    Upcasts float16 attributions to float32 before any aggregation.
+    Attributions are float32 as written; the astype is a harmless guard for any
+    legacy float16 dataset generated before that fix.
     """
     dataset = ds.dataset(path, partitioning="hive")
     filt = (ds.field("counterfactual") == counterfactual) if counterfactual else None
@@ -167,6 +168,12 @@ def build_event_log(source, counterfactual=None,
             df = df[df["counterfactual"] == counterfactual]
     else:
         df = load_attributions(source, counterfactual)
+
+    # SAE error nodes (feature_idx == -1, the Marks et al. reconstruction residual)
+    # are a faithfulness-accounting quantity, not a mineable activity: they are
+    # dense and large-magnitude, so leaving them in would let an "L{n}/F-1" event
+    # win a top-k slot in nearly every case and pollute the DFG. Drop before mining.
+    df = df[df["feature_idx"] != -1].copy()
 
     df = _add_case_id(df)
     df = FILTERS[filter_name](df, **(filter_params or {})).copy()

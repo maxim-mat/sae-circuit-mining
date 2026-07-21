@@ -217,10 +217,14 @@ def main():
             shutil.rmtree(args.attributions_dir)
         os.makedirs(args.attributions_dir, exist_ok=True)
 
-        # PyArrow Schema — compact: no string columns, float16 activations
+        # PyArrow Schema — compact: no string columns except the CF partition key.
+        # template_id: small int per unique 'template' string, so correlated-prompt
+        # blocking (calibrated_feature_selection block_col) can group prompts sharing
+        # a template as correlated trials.
         raw_schema = pa.schema([
             ('counterfactual', pa.string()),
             ('prompt_idx', pa.int32()),
+            ('template_id', pa.int16()),
             ('token_idx', pa.int16()),
             ('token_id', pa.int32()),
             ('feature_idx', pa.int32()),
@@ -232,12 +236,18 @@ def main():
         batch_data = {
             'counterfactual': [],
             'prompt_idx': [],
+            'template_id': [],
             'token_idx': [],
             'token_id': [],
             'feature_idx': [],
             'attribution': [],
             'layer': []
         }
+
+        # Deterministic-within-run map from a prompt's 'template' string to a small
+        # int id. IOI has ~15 templates; ids only need to be consistent inside one
+        # generated dataset for block-column grouping.
+        template_ids = {}
 
         def flush_batch():
             if len(batch_data['prompt_idx']) == 0:
@@ -267,6 +277,10 @@ def main():
         counterfactuals = {k: v for k, v in item.items() if isinstance(v, dict) and 'prompt' in v}
         if not args.save_attributions or not counterfactuals:
             continue
+
+        # Small stable id for this prompt's template (constant across its CFs).
+        template = item.get("template", "")
+        template_id = template_ids.setdefault(template, len(template_ids))
 
         clean_token_ids = item["tokens"]
         if not isinstance(clean_token_ids, torch.Tensor):
@@ -364,13 +378,17 @@ def main():
                         
                         token_indices_cpu = token_indices.cpu().numpy()
                         feature_indices_cpu = feature_indices.cpu().numpy()
-                        vals_cpu = vals.cpu().detach().to(torch.float16).numpy()
-                        
+                        # float32: the fp16 subnormal floor flushes small IEs to
+                        # zero and quantizes the null tail that calibrates Part-1
+                        # selection. zstd absorbs the size cost.
+                        vals_cpu = vals.cpu().detach().numpy()
+
                         num_events = len(token_indices_cpu)
                         total_elements_written += num_events
-                        
+
                         batch_data['counterfactual'].extend([cf_name] * num_events)
                         batch_data['prompt_idx'].extend([p_idx] * num_events)
+                        batch_data['template_id'].extend([template_id] * num_events)
                         batch_data['token_idx'].extend(token_indices_cpu.tolist())
                         batch_data['token_id'].extend([clean_token_ids[t].item() for t in token_indices_cpu])
                         batch_data['feature_idx'].extend(feature_indices_cpu.tolist())
@@ -385,12 +403,13 @@ def main():
                     err_clean = acts_clean - sae.decode(f_clean.unsqueeze(0))[0]
                     err_cf = acts_cf - sae.decode(f_corrupt.unsqueeze(0))[0]
                     err_attr = direction * (grad_acts * (err_cf - err_clean)).sum(dim=-1)
-                    err_cpu = err_attr.cpu().detach().to(torch.float16).numpy()
+                    err_cpu = err_attr.cpu().detach().numpy()  # float32 (see above)
                     n_err = len(err_cpu)
                     total_elements_written += n_err
 
                     batch_data['counterfactual'].extend([cf_name] * n_err)
                     batch_data['prompt_idx'].extend([p_idx] * n_err)
+                    batch_data['template_id'].extend([template_id] * n_err)
                     batch_data['token_idx'].extend(range(n_err))
                     batch_data['token_id'].extend([clean_token_ids[t].item() for t in range(n_err)])
                     batch_data['feature_idx'].extend([-1] * n_err)

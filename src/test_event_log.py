@@ -63,6 +63,15 @@ def test_feature_role():
     assert log["activity"].str.endswith("@OTHER").any()  # token 0 unmapped
 
 
+def test_error_nodes_excluded():
+    df = make_df()
+    df.loc[len(df)] = {"counterfactual": "cf1", "prompt_idx": 0, "token_idx": 0,
+                       "token_id": 7, "feature_idx": -1, "attribution": -9.9, "layer": 0}
+    log = build_event_log(df, filter_name="abs_threshold", filter_params={"tau": 0.0})
+    # The large-magnitude error node (feature_idx=-1) must not become an activity.
+    assert not log["activity"].str.contains("/F-1").any(), log["activity"].tolist()
+
+
 def test_to_pm4py():
     out = to_pm4py(build_event_log(make_df(), ordering_name="layer_interval"))
     assert {"case:concept:name", "concept:name", "time:timestamp", "start_timestamp"} <= set(out.columns)
@@ -75,5 +84,6 @@ if __name__ == "__main__":
     test_min_case_frac()
     test_ordering()
     test_feature_role()
+    test_error_nodes_excluded()
     test_to_pm4py()
     print("all event_log checks passed")
