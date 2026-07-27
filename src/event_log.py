@@ -1,3 +1,5 @@
+# Deprecated, replaced with new pipeline, probably need to delete
+
 """Build process-mining event logs from SAE attribution datasets.
 
 Converts the partitioned Parquet dataset written by main.py --save_attributions
