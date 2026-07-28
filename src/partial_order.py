@@ -2,7 +2,7 @@
 Part 2 — partial-order construction and Petri-net discovery.
 
 Consumes the event log written by Part 1 (calibrated_feature_selection.py):
-    eventlog_<cf>.parquet  with columns
+    event_logs/eventlog/counterfactual=<cf>/  with columns
       prompt_idx, layer, token_idx, token_id, feature_idx, attribution,
       abs_attr, sign
 plus an EDGE-ATTRIBUTION table (computed by a separate model pass — see
@@ -479,7 +479,8 @@ def export_dfg(dfg_dict, starts, ends, path: str):
 # ===========================================================================
 
 def load_event_log(path: str) -> pd.DataFrame:
-    """Load an eventlog_<cf>.parquet written by Part 1."""
+    """Load a Part-1 event log: the hive partition dir
+    event_logs/eventlog/counterfactual=<cf>/ (or a single parquet file)."""
     df = pd.read_parquet(path)
     needed = {"prompt_idx", "layer", "token_idx", "feature_idx", "attribution"}
     missing = needed - set(df.columns)
@@ -506,11 +507,21 @@ def run(
     DFG -> IM-f. Writes the DFG and (if pm4py present) a PNML net."""
     import os
 
-    cf = os.path.basename(event_log_path).replace("eventlog_", "").replace(".parquet", "")
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"[{cf}] loading event log ...")
+    print(f"loading event log {event_log_path} ...")
     event_log = load_event_log(event_log_path)
+    # Part 2 mines one counterfactual at a time. The counterfactual is a hive
+    # partition column when the eventlog root is read; pointing at a single
+    # counterfactual=<cf>/ dir hides it, so fall back to the dir name.
+    if "counterfactual" in event_log:
+        cfs = event_log["counterfactual"].astype(str).unique()
+        if len(cfs) > 1:
+            raise ValueError(f"event log mixes counterfactuals {list(cfs)}; "
+                             f"pass one counterfactual=<cf>/ partition")
+        cf = cfs[0]
+    else:
+        cf = os.path.basename(event_log_path.rstrip("/\\")).split("=")[-1]
     ev = prompt_events(event_log)
     print(f"[{cf}] {len(event_log):,} log rows -> {len(ev):,} prompt-events "
           f"over {ev['prompt_idx'].nunique()} prompts, "
@@ -610,7 +621,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Part 2: post-hoc virtual-weight edges + Petri-net discovery "
                     "from a Part-1 event log.")
-    ap.add_argument("--event_log", help="eventlog_<cf>.parquet from Part 1")
+    ap.add_argument("--event_log",
+                    help="Part-1 event log: event_logs/eventlog/counterfactual=<cf>/")
     ap.add_argument("--release", default="gpt2-small-res-jb",
                     help="SAE release (for W_enc/W_dec virtual weights)")
     ap.add_argument("--out_dir", default="nets")

@@ -25,7 +25,10 @@ Pipeline (per counterfactual type):
 Input: the hive-partitioned parquet dataset written by main.py, partitioned
 by counterfactual and layer, with columns prompt_idx, token_idx, token_id,
 feature_idx, attribution(float16). Use load_counterfactual() to read one CF;
-the CLI (see bottom) runs the whole pipeline per CF and writes event logs.
+the CLI (see bottom) runs the whole pipeline per CF and writes the feature
+table and event log back in the SAME hive layout, partitioned by
+counterfactual: {out_dir}/features|eventlog/counterfactual=<cf>/*.parquet.
+Part 2 (partial_order.py) and edge_attribution.py --nodes read those dirs.
 Optional columns if regenerated: is_error (bool) for SAE error nodes; a block
 column (e.g. template_id) for correlated-prompt blocking — NOT present in the
 current data, so recurrence trials default to individual prompts until it is
@@ -445,6 +448,29 @@ def negative_control(df: pd.DataFrame, seed: int = 0, **kwargs) -> pd.Series:
 # CLI — run the pipeline on the real partitioned attribution dataset
 # ===========================================================================
 
+def _write_hive(df: pd.DataFrame, root: str, counterfactual: str) -> str:
+    """Write one CF as {root}/counterfactual=<cf>/*.parquet.
+
+    Same hive layout main.py writes for the raw attributions, so downstream
+    readers that open a directory as one pyarrow dataset (edge_attribution's
+    --nodes, event_log.load_attributions) see the counterfactual as a column
+    and can read every CF at once. delete_matching keeps a re-run from
+    appending duplicate rows to the CF's partition.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_to_dataset(
+        pa.Table.from_pandas(df.assign(counterfactual=str(counterfactual)),
+                             preserve_index=False),
+        root_path=root,
+        partition_cols=["counterfactual"],
+        existing_data_behavior="delete_matching",
+        compression="zstd",
+    )
+    return os.path.join(root, f"counterfactual={counterfactual}")
+
+
 def run_counterfactual(
     attributions_dir: str,
     counterfactual: str,
@@ -455,7 +481,8 @@ def run_counterfactual(
     min_sign_consistency: float | None = 0.8,
     run_control: bool = True,
 ) -> pd.Series:
-    """Load one CF, run selection, write feature table + event log, and
+    """Load one CF, run selection, write feature table + event log as hive
+    partitions ({out_dir}/features|eventlog/counterfactual=<cf>/), and
     (optionally) the null-simulation control. Returns the summary."""
     print(f"[{counterfactual}] loading ...")
     df = load_counterfactual(attributions_dir, counterfactual, drop_zeros=True)
@@ -489,10 +516,8 @@ def run_counterfactual(
 
     os.makedirs(out_dir, exist_ok=True)
     log = build_event_log(dfs, feats)
-    feats_path = os.path.join(out_dir, f"features_{counterfactual}.parquet")
-    log_path = os.path.join(out_dir, f"eventlog_{counterfactual}.parquet")
-    feats.to_parquet(feats_path, index=False)
-    log.to_parquet(log_path, index=False)
+    feats_path = _write_hive(feats, os.path.join(out_dir, "features"), counterfactual)
+    log_path = _write_hive(log, os.path.join(out_dir, "eventlog"), counterfactual)
     print(f"\nwrote {feats_path}\nwrote {log_path}")
     print(f"event log: {len(log):,} events | "
           f"{log.groupby(FEATURE_COLS).ngroups} activities")
@@ -506,7 +531,8 @@ def main():
     ap.add_argument("--attributions_dir", default="sae_attributions",
                     help="Root of the hive-partitioned parquet dataset.")
     ap.add_argument("--out_dir", default="event_logs",
-                    help="Where to write per-CF feature tables and event logs.")
+                    help="Root for the hive-partitioned outputs: "
+                         "{out_dir}/features|eventlog/counterfactual=<cf>/.")
     ap.add_argument("--counterfactual", default=None,
                     help="CF partition to process; default = all found.")
     ap.add_argument("--q", type=float, default=1.0,
