@@ -106,18 +106,18 @@ def load_model_and_saes(release, device):
     model = HookedTransformer.from_pretrained("gpt2-small", device=device)
     sorted_items = sorted(release_saes.items(),
                           key=lambda x: int(x[0].split(".")[1]) if "." in x[0] else 0)
-    sae, hook, w_dec_t = {}, {}, {}
+    sae, hook_points, w_dec_t = {}, {}, {}
     for sid, hook_point in sorted_items:
         layer = int(sid.split(".")[1])
         s = SAE.from_pretrained(release=release, sae_id=sid, device=device)[0]
         sae[layer] = s
-        hook[layer] = hook_point
+        hook_points[layer] = hook_point
         w_dec_t[layer] = s.W_dec.T if s.W_dec.shape[0] == s.cfg.d_sae else s.W_dec
     prepend_bos = getattr(list(sae.values())[0].cfg, "prepend_bos", True)
-    return model, sae, hook, w_dec_t, prepend_bos
+    return model, sae, hook_points, w_dec_t, prepend_bos
 
 
-def node_pass(model, sae, hook, w_dec_t, layers, clean_tokens, cf_tokens, metric_fn, item):
+def node_pass(model, sae, hook_points, w_dec_t, layers, clean_tokens, cf_tokens, metric_fn, item):
     """One clean fwd+bwd and one CF fwd. Returns per-layer dicts:
       grad_f[layer]  = dm/df at j  (direction NOT applied)  [seq, d_sae]
       grad_res[layer]= dm/dresidual                          [seq, d_model]
@@ -128,7 +128,8 @@ def node_pass(model, sae, hook, w_dec_t, layers, clean_tokens, cf_tokens, metric
     resid_clean = {}
 
     def cap_grad(layer):
-        def h(tensor, hook_):
+        # TL calls hooks as h(tensor, hook=hook_point): 2nd arg is keyword-named `hook`.
+        def h(tensor, hook):
             tensor.retain_grad()
             resid_clean[layer] = tensor
             return tensor
@@ -136,7 +137,7 @@ def node_pass(model, sae, hook, w_dec_t, layers, clean_tokens, cf_tokens, metric
 
     model.zero_grad(set_to_none=True)
     for L in layers:
-        model.add_hook(hook[L], cap_grad(L), dir="fwd")
+        model.add_hook(hook_points[L], cap_grad(L), dir="fwd")
     clean_logits = model(clean_tokens)
     metric_tensor, direction = metric_fn(logits=clean_logits, tokens=clean_tokens, item=item, model=model)
     metric_tensor.backward()
@@ -144,7 +145,7 @@ def node_pass(model, sae, hook, w_dec_t, layers, clean_tokens, cf_tokens, metric
 
     resid_cf = {}
     for L in layers:
-        model.add_hook(hook[L], (lambda layer: (lambda t, h_: resid_cf.__setitem__(layer, t) or t))(L), dir="fwd")
+        model.add_hook(hook_points[L], (lambda layer: (lambda t, hook: resid_cf.__setitem__(layer, t) or t))(L), dir="fwd")
     with torch.no_grad():
         model(cf_tokens)
     model.reset_hooks()
@@ -169,14 +170,14 @@ def node_pass(model, sae, hook, w_dec_t, layers, clean_tokens, cf_tokens, metric
     return grad_f, grad_res, df, dres, direction
 
 
-def edge_pass(model, sae, hook, clean_tokens, up_L, down_L,
+def edge_pass(model, sae, hook_points, clean_tokens, up_L, down_L,
               grad_f_j, grad_res_j, df_i, dres_i, survivors_i, survivors_j,
               direction, include_error):
     """Edges from every surviving node at up_L to every surviving node at down_L,
     for one prompt. Returns list of (up_feature, down_feature, attribution)."""
     store_i, store_j = {}, {}
 
-    def sub_hook(tensor, hook_):
+    def sub_hook(tensor, hook):
         x = tensor[0]
         f_val = sae[up_L].encode(x.unsqueeze(0))[0]
         recon_val = sae[up_L].decode(f_val.unsqueeze(0))[0]
@@ -186,13 +187,13 @@ def edge_pass(model, sae, hook, clean_tokens, up_L, down_L,
         recon = sae[up_L].decode(f.unsqueeze(0))[0]
         return (recon + res).unsqueeze(0)
 
-    def cap_hook(tensor, hook_):
+    def cap_hook(tensor, hook):
         store_j["y"] = tensor[0]
         return tensor
 
     model.reset_hooks()
-    model.add_hook(hook[up_L], sub_hook, dir="fwd")
-    model.add_hook(hook[down_L], cap_hook, dir="fwd")
+    model.add_hook(hook_points[up_L], sub_hook, dir="fwd")
+    model.add_hook(hook_points[down_L], cap_hook, dir="fwd")
     model(clean_tokens)
     model.reset_hooks()
 
@@ -245,7 +246,7 @@ def main():
 
     dataset = load_dataset(path=args.dataset, split=args.split, streaming=False)
     metric_fn = get_metric_function(args.dataset)
-    model, sae, hook, w_dec_t, prepend_bos = load_model_and_saes(args.release, args.device)
+    model, sae, hook_points, w_dec_t, prepend_bos = load_model_and_saes(args.release, args.device)
 
     if os.path.exists(args.output_dir):
         shutil.rmtree(args.output_dir)
@@ -297,12 +298,12 @@ def main():
 
             layers = sorted(layer_survivors)
             grad_f, grad_res, df, dres, direction = node_pass(
-                model, sae, hook, w_dec_t, layers, clean_tokens, cf_tokens, metric_fn, row
+                model, sae, hook_points, w_dec_t, layers, clean_tokens, cf_tokens, metric_fn, row
             )
 
             for up_L, down_L in _layer_pairs(layers, args.pairs == "all"):
                 edges = edge_pass(
-                    model, sae, hook, clean_tokens, up_L, down_L,
+                    model, sae, hook_points, clean_tokens, up_L, down_L,
                     grad_f[down_L], grad_res[down_L], df[up_L], dres[up_L],
                     layer_survivors[up_L], layer_survivors[down_L], direction, args.include_error,
                 )

@@ -75,7 +75,112 @@ def test_zero_delta_gives_zero_edge():
     assert torch.allclose((gfi * df_u).sum(dim=0), torch.zeros(n_u))
 
 
+def _stub_gpu_deps():
+    """edge_attribution imports sae_lens/transformer_lens at module scope but only
+    uses them in load_model_and_saes, which the fake-model check never calls. Stub
+    them when absent so this check runs off the GPU box too."""
+    import sys
+    import types
+    try:
+        import sae_lens  # noqa: F401
+        import transformer_lens  # noqa: F401
+        return
+    except ImportError:
+        pass
+    for name in ("sae_lens", "sae_lens.loading",
+                 "sae_lens.loading.pretrained_saes_directory", "transformer_lens"):
+        sys.modules.setdefault(name, types.ModuleType(name))
+    sys.modules["sae_lens"].SAE = object
+    sys.modules["sae_lens.loading.pretrained_saes_directory"].get_pretrained_saes_directory = dict
+    sys.modules["transformer_lens"].HookedTransformer = object
+
+
+class FakeSAE:
+    """Linear stand-in for an SAE: encode/decode are matmuls, so the autograd
+    graph through the feature basis stays intact."""
+    def __init__(self, d_model, d_sae):
+        self.W_enc = torch.randn(d_model, d_sae)
+        self.W_dec = torch.randn(d_sae, d_model)
+
+    def encode(self, x):
+        return x @ self.W_enc
+
+    def decode(self, f):
+        return f @ self.W_dec
+
+
+class FakeTLModel:
+    """Mimics HookedTransformer's hook protocol: a registered hook is called as
+    fn(tensor, hook=hook_point) with the second argument passed by KEYWORD. Layers
+    are chained through fixed linear maps so downstream really depends on upstream.
+    """
+    def __init__(self, layers, seq, d_model):
+        self.order = sorted(layers)
+        self.x0 = torch.randn(1, seq, d_model, requires_grad=True)
+        self.M = {L: torch.randn(d_model, d_model) for L in self.order}
+        self.hooks = []
+
+    def add_hook(self, name, fn, dir="fwd"):
+        self.hooks.append((name, fn))
+
+    def reset_hooks(self):
+        self.hooks = []
+
+    def zero_grad(self, set_to_none=True):
+        pass
+
+    def __call__(self, tokens):
+        x, outs = self.x0, []
+        for L in self.order:
+            x = x @ self.M[L]
+            for name, fn in self.hooks:
+                if name == L:
+                    x = fn(x, hook=L)  # keyword, exactly as transformer_lens does
+            outs.append(x)
+        return torch.stack(outs).sum(0)
+
+
+def _fake_setup(layers=(0, 1, 2), seq=4, d_model=6, d_sae=5):
+    model = FakeTLModel(layers, seq, d_model)
+    sae = {L: FakeSAE(d_model, d_sae) for L in layers}
+    hook_points = {L: L for L in layers}               # hook_point name == layer here
+    w_dec_t = {L: sae[L].W_dec.T for L in layers}
+    tokens = torch.zeros(1, seq, dtype=torch.long)
+    return model, sae, hook_points, w_dec_t, tokens
+
+
+def test_passes_run_under_transformer_lens_hook_protocol():
+    """Regression: hooks must take their 2nd arg as `hook` (TL passes it by keyword).
+    Naming it anything else raised TypeError at the first model call in node_pass."""
+    _stub_gpu_deps()
+    from edge_attribution import edge_pass, node_pass
+
+    torch.manual_seed(0)
+    layers = (0, 1, 2)
+    model, sae, hook_points, w_dec_t, tokens = _fake_setup(layers)
+    metric_fn = lambda logits, tokens, item, model: (logits.sum(), 1)
+
+    grad_f, grad_res, df, dres, direction = node_pass(
+        model, sae, hook_points, w_dec_t, list(layers), tokens, tokens, metric_fn, None)
+
+    for L in layers:
+        assert grad_f[L].shape == (4, 5), (L, grad_f[L].shape)   # [seq, d_sae]
+        assert grad_res[L].shape == (4, 6), (L, grad_res[L].shape)
+        assert df[L].shape == (4, 5) and dres[L].shape == (4, 6)
+        assert torch.isfinite(grad_f[L]).all()
+
+    # The fake ignores tokens, so clean == cf and df[0] is exactly zero (no edges by
+    # construction — see test_zero_delta_gives_zero_edge). Feed nonzero deltas instead.
+    survivors = [0, 2, 4]
+    edges = edge_pass(model, sae, hook_points, tokens, 0, 2,
+                      grad_f[2], grad_res[2], torch.randn_like(df[0]), torch.randn_like(dres[0]),
+                      survivors, survivors, direction, include_error=False)
+    assert edges, "edge_pass returned no edges through the fake chain"
+    assert all(u in survivors and d in survivors for u, d, _ in edges)
+
+
 if __name__ == "__main__":
     test_feature_edge_matches_closed_form()
     test_zero_delta_gives_zero_edge()
+    test_passes_run_under_transformer_lens_hook_protocol()
     print("all edge_attribution checks passed")
