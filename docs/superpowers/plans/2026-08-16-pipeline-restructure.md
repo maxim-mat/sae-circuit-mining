@@ -32,11 +32,14 @@ section is everything you need that is not already in the repo.
 D1–D5), then this plan. Do not re-derive the reference-implementation findings —
 they cost the bulk of a session and are recorded in the spec.
 
-**Repo state at plan time** (commit `b297d97`): `src/event_log.py`,
-`src/discover.py`, `src/test_event_log.py` were already deleted;
-`src/edge_attribution.py`, `src/main.py`, `src/partial_order.py` had uncommitted
-modifications; `src/sae_layers.py` was untracked. The pipeline described here
-does not exist yet — `main.py` still contains the monolithic attribution loop.
+**Repo state at plan time** (commit `b297d97`, clean tree): `src/event_log.py`,
+`src/discover.py` and `src/test_event_log.py` had been deleted; the tracked
+modules are `main.py`, `metrics.py`, `sae_layers.py`, `edge_attribution.py`,
+`partial_order.py`, `calibrated_feature_selection.py`, `trace_log_converter.py`,
+`visualize_model.py`, and four `test_*.py` files living in `src/` rather than
+`tests/`. The pipeline described here does not exist yet — `main.py` still
+contains the monolithic attribution loop, and there is no `configs/`, no
+`outputs/`, and no pytest setup.
 
 **Reference implementation:** clone or browse `saprmarks/feature-circuits` at
 commit `7fbd82b`. The files that matter are `attribution.py` (`_pe_attrib`,
