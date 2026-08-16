@@ -123,6 +123,8 @@ starting Task 1.
 
 `sae_layer_ordinal` is **HIGH risk** — gitnexus reports 10 impacted symbols, 3 broken execution flows. Direct callers: `main.py:main`, `partial_order.py:load_sae_directions`, `sae_layers.py:sorted_saes`; transitive: `edge_attribution.py:load_model_and_saes` → `edge_attribution.py:main`, `partial_order.py:run`. Task 3 replaces it. Tasks 3, 6, 8 and the rename step in Task 9 must land together before the tree is coherent again; do not stop in the middle of that run.
 
+That figure was measured against a **stale index** (it still listed the deleted `event_log.py`). Re-run `node .gitnexus/run.cjs analyze`, then `impact({target: "sae_layer_ordinal", direction: "upstream", repo: "sae-circuit-mining"})`, before starting Task 3 — the real blast radius may be smaller now that three modules are gone.
+
 ---
 
 ## Task 1: Config schema and entry point
