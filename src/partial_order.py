@@ -54,6 +54,8 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
+from sae_layers import sae_layer_ordinal
+
 EVENT_KEY = ["prompt_idx", "layer", "feature_idx"]
 EDGE_COLS = ["prompt_idx", "src_layer", "src_feat", "dst_layer", "dst_feat", "edge_ie"]
 
@@ -131,7 +133,7 @@ def load_sae_directions(release: str, device: str = "cpu") -> dict:
     saes_map = get_pretrained_saes_directory()[release].saes_map
     dirs = {}
     for sid in saes_map:
-        layer = int(sid.split(".")[1]) if "." in sid else 0
+        layer = sae_layer_ordinal(sid)
         sae = SAE.from_pretrained(release=release, sae_id=sid, device=device)[0]
         W_enc = sae.W_enc.detach().cpu().float().numpy()          # (d_model, d_sae)
         W_dec = sae.W_dec.detach().cpu().float().numpy()          # (d_sae, d_model)

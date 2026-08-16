@@ -56,6 +56,7 @@ from sae_lens.loading.pretrained_saes_directory import get_pretrained_saes_direc
 from transformer_lens import HookedTransformer
 
 from metrics import get_metric_function
+from sae_layers import sorted_saes
 
 logger = logging.getLogger("sae_edge_attribution")
 
@@ -101,14 +102,12 @@ def load_node_set(path, include_error):
 
 def load_model_and_saes(release, device):
     """Load gpt2-small and its per-layer residual SAEs. Returns model plus
-    dicts keyed by integer layer: sae, hook_point, W_dec_T (d_model x d_sae)."""
+    dicts keyed by residual-stream ordinal (see sae_layers.sae_layer_ordinal —
+    NOT the block number): sae, hook_point, W_dec_T (d_model x d_sae)."""
     release_saes = get_pretrained_saes_directory()[release].saes_map
     model = HookedTransformer.from_pretrained("gpt2-small", device=device)
-    sorted_items = sorted(release_saes.items(),
-                          key=lambda x: int(x[0].split(".")[1]) if "." in x[0] else 0)
     sae, hook, w_dec_t = {}, {}, {}
-    for sid, hook_point in sorted_items:
-        layer = int(sid.split(".")[1])
+    for layer, sid, hook_point in sorted_saes(release_saes):
         s = SAE.from_pretrained(release=release, sae_id=sid, device=device)[0]
         sae[layer] = s
         hook[layer] = hook_point

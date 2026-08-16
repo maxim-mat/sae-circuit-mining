@@ -13,6 +13,7 @@ from transformer_lens.utils import tokenize_and_concatenate
 import pyarrow as pa
 import pyarrow.parquet as pq
 from metrics import get_metric_function
+from sae_layers import sae_layer_ordinal, sorted_saes
 
 def parse_args():
     parser = argparse.ArgumentParser(description="SAE Circuit Mining event generator.")
@@ -174,10 +175,7 @@ def main():
     logger.info("Loading transformer model 'gpt2-small'...")
     model = HookedTransformer.from_pretrained("gpt2-small", device=args.device)
 
-    sorted_sae_items = sorted(
-        release_saes.items(), 
-        key=lambda x: int(x[0].split('.')[1]) if '.' in x[0] else 0
-    )
+    sorted_sae_items = [(sid, hook_point) for _, sid, hook_point in sorted_saes(release_saes)]
 
     logger.info(f"Loading {len(sorted_sae_items)} SAEs for layers...")
     sae_objects = {sid: SAE.from_pretrained(release=args.release, sae_id=sid, device=args.device)[0] for sid, _ in sorted_sae_items}
@@ -344,7 +342,7 @@ def main():
             model.reset_hooks()
             
             for sid, hook_point in sorted_sae_items:
-                layer_idx = int(sid.split('.')[1])
+                layer_idx = sae_layer_ordinal(sid)
                 sae = sae_objects[sid]
                 
                 acts_clean = acts_dict_clean[hook_point][0]
