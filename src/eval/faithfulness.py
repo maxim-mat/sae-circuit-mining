@@ -16,6 +16,7 @@ permutes it across the batch, "zero" writes zero.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -60,18 +61,35 @@ def _ablation_values(feats: torch.Tensor, style: str) -> torch.Tensor:
     raise ValueError(f"Unknown ablation {style!r}; expected 'mean', 'resample' or 'zero'")
 
 
+def resolve_start_layer(suite, start_layer: int) -> int:
+    """First block whose sites take part in the ablation.
+
+    Marks et al. §3.2: "we ignore the first 1/3 of our circuit, and only evaluate
+    the latter 2/3" -- early features key on specific tokens, and the train and
+    test splits do not share tokens, so scoring the early segment measures
+    vocabulary overlap rather than circuit quality. start_layer = -1 reproduces
+    that default; any other value is used as given.
+    """
+    if start_layer != -1:
+        return start_layer
+    n_blocks = max(site.block for site in suite.sites) + 1
+    return math.ceil(n_blocks / 3)
+
+
 def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
                        ablation: str, handle_errors: str, device: str,
-                       prepend_bos: bool = True) -> float:
+                       prepend_bos: bool = True, start_layer: int = -1) -> float:
     """Mean metric with every feature outside `keep_mask` ablated.
 
     keep_mask maps site_ordinal -> set of kept feature indices (ERROR_IDX for the
     reconstruction-error term). Pass None to keep everything (that is F(M)).
     handle_errors: "keep" never ablates the error term, "remove" always does,
-    "default" lets the mask decide.
+    "default" lets the mask decide. Sites before start_layer are left untouched.
     """
     if handle_errors not in ("default", "keep", "remove"):
         raise ValueError(f"Unknown handle_errors {handle_errors!r}")
+    first_block = resolve_start_layer(suite, start_layer)
+    ablated_sites = [s for s in suite.sites if s.block >= first_block]
 
     # Ablation references are batch statistics, so every example is run in one
     # padded-free batch: the loaders guarantee a single token length when
@@ -79,8 +97,6 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
     token_batch = torch.cat(
         [model.to_tokens(ex.clean_prefix, prepend_bos=prepend_bos) for ex in examples]
     ).to(device)
-
-    site_by_hook = {site.hook: site for site in suite.sites}
 
     def make_hook(site):
         sae = saes[site.sae_id]
@@ -112,7 +128,7 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
     with torch.no_grad():
         logits = model.run_with_hooks(
             token_batch,
-            fwd_hooks=[(site.hook, make_hook(site)) for site in suite.sites],
+            fwd_hooks=[(site.hook, make_hook(site)) for site in ablated_sites],
         )
         scores = [
             float(metric_fn(logits=logits[i:i + 1], example=ex, model=model,
@@ -149,7 +165,8 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
 
     common = dict(ablation=cfg.evaluation.ablation,
                   handle_errors=cfg.evaluation.handle_errors,
-                  device=cfg.suite.device, prepend_bos=prepend_bos)
+                  device=cfg.suite.device, prepend_bos=prepend_bos,
+                  start_layer=cfg.evaluation.start_layer)
     f_m = run_with_ablations(model, saes, suite, examples, None, metric_fn, **common)
     f_c = run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn, **common)
     f_empty = run_with_ablations(model, saes, suite, examples, {}, metric_fn, **common)
@@ -157,7 +174,9 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     result = {
         "faithfulness": faithfulness(f_c, f_m, f_empty),
         "F_C": f_c, "F_M": f_m, "F_empty": f_empty,
+        "n_nodes": len(circuit.nodes),
         "n_examples": len(examples),
+        "start_layer": resolve_start_layer(suite, cfg.evaluation.start_layer),
         "runtime_s": round(time.time() - started, 2),
     }
     (Path(out_dir) / "faithfulness.json").write_text(json.dumps(result, indent=2))

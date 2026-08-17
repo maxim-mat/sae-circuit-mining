@@ -17,3 +17,18 @@ def test_circuit_beating_the_full_model_exceeds_one():
 def test_degenerate_denominator_raises():
     with pytest.raises(ZeroDivisionError):
         faithfulness(f_c=0.5, f_m=1.0, f_empty=1.0)
+
+
+from src.eval.faithfulness import resolve_start_layer
+from src.models.suites import build_suite
+
+
+def test_default_start_layer_skips_the_first_third():
+    """Marks et al. 3.2 evaluate only the latter 2/3 of the circuit: early
+    features key on specific tokens, which differ between train and test."""
+    assert resolve_start_layer(build_suite("pythia-marks"), -1) == 2   # 6 blocks
+    assert resolve_start_layer(build_suite("gpt2-res"), -1) == 4       # 12 blocks
+
+
+def test_explicit_start_layer_is_used_verbatim():
+    assert resolve_start_layer(build_suite("pythia-marks"), 0) == 0
