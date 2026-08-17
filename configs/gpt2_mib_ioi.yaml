@@ -1,0 +1,26 @@
+suite:
+  name: gpt2-res
+data:
+  path: mib-bench/ioi
+  loader: mib
+  num_examples: 100
+  use_min_length_only: false
+  counterfactual: abc          # one run, one counterfactual
+attribution:
+  method: ig
+  ig_steps: 10
+  metric: mib_logit_diff
+selection:
+  aggregation: sum
+  method: calibrated
+edges:
+  threshold: 0.01
+  template: total_effect
+  pairs: consecutive
+  filter_mode: both
+evaluation:
+  enabled: false
+logging:
+  backend: [wandb]
+  group: gpt2-baseline
+seed: 42

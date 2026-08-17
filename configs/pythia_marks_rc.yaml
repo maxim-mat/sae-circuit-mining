@@ -1,0 +1,28 @@
+# Reproduction target: Marks et al. 2025 (arXiv:2403.19647) README worked example
+#   scripts/get_circuit.sh EleutherAI/pythia-70m-deduped rc_train 0.1 0.01 none
+suite:
+  name: pythia-marks
+data:
+  path: data/marks/rc_train.json
+  loader: sva
+  num_examples: 100
+  use_min_length_only: true
+attribution:
+  method: ig
+  ig_steps: 10
+  metric: sva_logit_diff
+selection:
+  aggregation: none
+  method: threshold
+  node_threshold: 0.1
+edges:
+  threshold: 0.01
+  template: marks
+  filter_mode: marks
+evaluation:
+  data_path: data/marks/rc_test.json
+  ablation: mean
+logging:
+  backend: [wandb]
+  group: marks-repro
+seed: 42
