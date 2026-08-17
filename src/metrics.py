@@ -1,94 +1,66 @@
+"""Task metrics.
+
+Every metric returns a bare scalar with the sign already folded in, so that the
+indirect effect grad(m) . delta is literally the IE of the metric being
+reported. The previous (value, direction) convention multiplied the effect
+AFTER the gradient, which is only equivalent for direction = +/-1 and has no
+counterpart in Marks et al. (arXiv:2403.19647) -- they put the sign inside the
+metric, before backprop.
+"""
+from __future__ import annotations
+
 import torch
 
-def next_token_loss_metric(logits, tokens, **kwargs):
-    """
-    Standard next-token prediction loss over the sequence.
-    Lower is better, so direction is -1.
-    """
-    shift_logits = logits[0, :-1, :].contiguous()
-    shift_labels = tokens[0, 1:].contiguous()
-    
-    loss = torch.nn.functional.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)), 
-        shift_labels.view(-1), 
-        reduction='sum'
-    )
-    return loss, -1
+
+def sva_logit_diff(logits, example, model, **_):
+    """Marks' paired subject-verb agreement metric:
+    logit(patch_answer) - logit(clean_answer), read at the final position."""
+    correct = model.to_single_token(example.patch_answer)
+    clean = model.to_single_token(example.clean_answer)
+    return logits[0, -1, correct] - logits[0, -1, clean]
 
 
-def logit_diff_metric(correct_logits=None, corrupted_logits=None, **kwargs):
-    """
-    Logit difference metric for tasks like Indirect Object Identification.
-    Assumes `correct_logits` and `corrupted_logits` are provided by the caller.
-    Higher is better, so direction is 1.
-    """
-    if correct_logits is None or corrupted_logits is None:
-        raise ValueError("logit_diff_metric requires `correct_logits` and `corrupted_logits` to be passed.")
-        
-    logit_diff = correct_logits - corrupted_logits
-    return logit_diff, 1
-
-
-def mib_bench_logit_diff_metric(logits, item, model, **kwargs):
-    """
-    Logit difference metric for mib-bench datasets.
-    Extracts correct and corrupted tokens from `item['choices']` and `item['answerKey']`.
-    """
-    if 'choices' not in item or 'answerKey' not in item:
-        raise ValueError("mib_bench_logit_diff_metric requires `choices` and `answerKey` in the item.")
-        
-    choices = item['choices']
-    answer_key = item['answerKey']
-
+def mib_logit_diff(logits, example, model, **_):
+    """MIB-bench: logit(correct choice) - logit(incorrect choice) at the final
+    position. Answers must be single tokens (assumes the GPT-2 leading space)."""
+    choices, answer_key = example.meta.get("choices"), example.meta.get("answerKey")
+    if choices is None or answer_key is None:
+        raise ValueError("mib_logit_diff requires 'choices' and 'answerKey' in meta")
     if len(choices) != 2:
-        raise ValueError(
-            f"mib_bench_logit_diff_metric expects exactly 2 choices, got {len(choices)}."
-        )
+        raise ValueError(f"mib_logit_diff expects exactly 2 choices, got {len(choices)}")
     if answer_key not in (0, 1):
-        raise ValueError(
-            f"mib_bench_logit_diff_metric expects answerKey in {{0, 1}}, got {answer_key!r}."
-        )
-
-    correct_str = choices[answer_key]
-    corrupted_str = choices[1 - answer_key]
-
-    # Logit diff is read at a single position, so answers must be single tokens.
-    # (assuming standard leading space for names in GPT-2)
+        raise ValueError(f"mib_logit_diff expects answerKey in {{0,1}}, got {answer_key!r}")
     try:
-        correct_token = model.to_single_token(" " + correct_str)
-        corrupted_token = model.to_single_token(" " + corrupted_str)
+        correct = model.to_single_token(" " + choices[answer_key])
+        wrong = model.to_single_token(" " + choices[1 - answer_key])
     except Exception as e:
         raise ValueError(
-            f"mib_bench_logit_diff_metric requires single-token answers; "
-            f"'{correct_str}' / '{corrupted_str}' do not each map to one GPT-2 token."
+            f"mib_logit_diff requires single-token answers; "
+            f"{choices[answer_key]!r}/{choices[1-answer_key]!r} are not"
         ) from e
-    
-    # Usually logit diff is measured at the last position of the prompt
-    pos = -1
-    
-    correct_logits = logits[0, pos, correct_token]
-    corrupted_logits = logits[0, pos, corrupted_token]
-    
-    logit_diff = correct_logits - corrupted_logits
-    return logit_diff, 1
+    return logits[0, -1, correct] - logits[0, -1, wrong]
 
 
-# Map dataset names to their corresponding metric functions
-DATASET_METRICS = {
-    'NeelNanda/pile-10k': next_token_loss_metric,
-    # Example for an IOI dataset:
-    # 'some/ioi-dataset': logit_diff_metric,
-    
-    'default': next_token_loss_metric
+def neg_next_token_loss(logits, example, model, tokens=None, **_):
+    """Negated next-token cross-entropy: higher is better, sign folded in."""
+    if tokens is None:
+        raise ValueError("neg_next_token_loss requires `tokens`")
+    shift_logits = logits[0, :-1, :].contiguous()
+    shift_labels = tokens[0, 1:].contiguous()
+    return -torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1), reduction="sum",
+    )
+
+
+METRICS = {
+    "sva_logit_diff": sva_logit_diff,
+    "mib_logit_diff": mib_logit_diff,
+    "neg_next_token_loss": neg_next_token_loss,
 }
 
-def get_metric_function(dataset_name):
-    """
-    Returns the appropriate metric function for the given dataset.
-    """
-    if dataset_name.startswith('mib-bench/'):
-        return mib_bench_logit_diff_metric
-        
-    if dataset_name in DATASET_METRICS:
-        return DATASET_METRICS[dataset_name]
-    return DATASET_METRICS['default']
+
+def get_metric(name: str):
+    if name not in METRICS:
+        raise KeyError(f"Unknown metric {name!r}; known: {sorted(METRICS)}")
+    return METRICS[name]
