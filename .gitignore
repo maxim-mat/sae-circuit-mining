@@ -226,3 +226,5 @@ CLAUDE.md
 # `data/` would also swallow the src/data package.
 /data/
 /outputs/
+/outputs_n100
+/outputs_sweep

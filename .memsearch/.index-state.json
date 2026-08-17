@@ -1,0 +1,16 @@
+{
+  "collection": "ms_sae_circuit_mining_c77e8244",
+  "failed_files": [],
+  "last_completed_at": "2026-08-17T16:46:05.682369Z",
+  "last_error": "RuntimeError: milvus-lite does not support Windows (no wheels on PyPI).\nUse a remote Milvus server instead:\n  docker run -d -p 19530:19530 milvusdb/milvus:latest standalone\n  MemSearch(milvus_uri='http://localhost:19530')\nOr run memsearch inside WSL2: https://learn.microsoft.com/en-us/windows/wsl/install",
+  "last_failed_at": "2026-08-17T16:46:05.682369Z",
+  "last_started_at": "2026-08-17T16:46:02.660538Z",
+  "milvus_uri": "~/.memsearch/milvus.db",
+  "operation": "index",
+  "paths": [
+    "D:/Projects/sae-circuit-mining/.memsearch/memory"
+  ],
+  "schema_version": 1,
+  "status": "error",
+  "updated_at": "2026-08-17T16:46:05.682369Z"
+}
