@@ -8,16 +8,20 @@ faithfulness. See `docs/ha-vs-marks.md` for the phase-2 comparison built on it.
 
 | Quantity | Marks (target) | Ours | Δ |
 |---|---|---|---|
-| Faithfulness | **0.21** | **0.2388** | +0.029 |
+| Faithfulness | **0.21** | **0.2011** | −0.009 |
 | Node count | **86** | **84** | −2 |
 | Edge count | not published per-circuit | 323 | — |
-| Completeness | not published per-circuit | −0.0221 (ideal 0) | — |
-| F(C) | — | +0.3806 | — |
+| Completeness | not published per-circuit | −0.0032 (ideal 0) | — |
+| F(C) | — | +0.3089 | — |
 | F(M) | — | +1.6189 | — |
-| F(∅) | — | −0.0078 | — |
+| F(∅) | — | −0.0209 | — |
 
-Source: wandb `maxim0/SAE`, group `marks-repro-rc`, run `marks-threshold-rc-n100`
-(`oobc2bhj`). Target: paper §3.3 ("a circuit with 86 nodes and faithfulness
+Measured with the corrected ablation reference (patch distribution, per
+`ablation.py`) and a position-resolved node mask; scored on the latter ⅔ of the
+circuit, which is the reading that matches their published figure — see
+`docs/ha-vs-marks.md` §2, and note their own CLI default gives 0.0650 instead.
+The original wandb run (`maxim0/SAE`, `marks-threshold-rc-n100`, `oobc2bhj`)
+reported 0.2388 before those two fixes. Target: paper §3.3 ("a circuit with 86 nodes and faithfulness
 0.21") plus the Fig. 7 caption pinning that circuit to T_N=0.1 / T_E=0.01 — the
 only place a threshold, a node count and a faithfulness appear together.
 **Fig. 3 is not a check on this**: it is indexed by node count with the threshold
