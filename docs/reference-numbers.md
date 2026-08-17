@@ -135,10 +135,64 @@ Reading of the result:
   anomalous value their table reports for MLP 0 — possibly a coincidence,
   possibly an index-mapping question in the `ctigges` release.
 
-Suggested next diagnostic: load `blocks.3.hook_resid_post` from the original
-`dictionary_learning` `.pt` dictionary and compare variance explained on the
-same 32 sequences. That distinguishes "the processed conversion is lossy at this
-site" from "our evaluation differs from theirs".
+### Root cause of the resid-3 gap — TransformerLens weight processing
+
+**Resolved without needing the original dictionaries.** Same SAE, same 32
+sequences, only the model's weight processing differs:
+
+| Site | `from_pretrained` (fold_ln + center_writing_weights + center_unembed) | `from_pretrained_no_processing` | Marks |
+|---|---|---|---|
+| `blocks.3.hook_resid_post` | 0.790 | **0.942** | 96% |
+| `blocks.2.hook_resid_post` | 0.946 | 0.952 | 96% |
+| `blocks.0.hook_resid_post` | 0.908 | 0.915 | 92% |
+| `blocks.4.hook_attn_out` | 0.733 | 0.734 | 83% |
+
+The −17 point gap becomes −1.8, in line with every other site.
+
+**Why.** `center_writing_weights` subtracts the mean-over-`d_model` component
+from every matrix that writes to the residual stream. That component is
+invisible to the *model* (the next LayerNorm removes it) but perfectly visible
+to an *SAE*, which was trained on the uncentered activation. Sites whose mean
+component is large — resid 3 here — are mis-reconstructed by exactly that
+amount. Marks ran nnsight on the raw HF model, so unprocessed weights are also
+the faithful choice for reproduction.
+
+**Confirmed by sae_lens' own metadata** (`sae.cfg.metadata`), which is
+authoritative and matches the measurement:
+
+| Release | `model_from_pretrained_kwargs` | `prepend_bos` |
+|---|---|---|
+| `gpt2-small-res-jb` | `{'center_writing_weights': True}` | `True` |
+| `pythia-70m-deduped-{res,att,mlp}-sm` | `None` | **`False`** |
+
+**The two suites need opposite treatment.** Loading gpt2-small *without*
+processing is catastrophic — `blocks.11.hook_resid_post` scores VE **−241**
+(L0 877) — because those SAEs were trained on TransformerLens-processed
+activations. So this is a per-suite property, not a global switch.
+
+### Two consequent defects in this repo (not yet fixed)
+
+1. **`src/models/suites.py:load_model_and_saes` hardcodes
+   `HookedTransformer.from_pretrained`**, silently applying full processing to
+   both suites. Every pythia number produced so far — including the 5-example
+   smoke run's faithfulness 0.179 — was computed on activations the SAEs were
+   not trained on.
+2. **`prepend_bos` is read wrongly.** Three call sites do
+   `getattr(sae.cfg, "prepend_bos", True)`, but in sae_lens 6.x that field lives
+   on `sae.cfg.metadata`, so the `getattr` always falls through to its `True`
+   default. The pythia SAEs declare `prepend_bos = False`. This was listed as
+   divergence 4 below ("believed equivalent, unverified"); it is now known to be
+   an actual defect, and fixing it aligns us with Marks, whose loader uses the
+   bare HF tokenizer.
+
+### Still unexplained: `blocks.4.hook_attn_out`
+
+0.733 against their 83%, and **unmoved** by weight processing (0.7329 →
+0.7338). `blocks.5.hook_attn_out` is also low (0.819 vs 89%). This is the one
+question the original `dictionary_learning` `.pt` dictionaries would still
+answer: whether the `ctigges` `_processed` conversion is lossy for the later
+attention SAEs, or whether our `hook_attn_out` placement differs from their
+`layer.attention` output.
 
 ---
 
