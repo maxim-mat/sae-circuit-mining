@@ -498,7 +498,7 @@ def load_event_log(path: str) -> pd.DataFrame:
 
 def run(
     event_log_path: str,
-    release: str,
+    suite_name: str,
     out_dir: str,
     weighting: str = "upstream",
     top_k_parents: int | None = 3,
@@ -532,8 +532,8 @@ def run(
           f"over {ev['example_idx'].nunique()} prompts, "
           f"{ev.groupby('site_ordinal').ngroups} layers")
 
-    print(f"[{cf}] loading SAE directions ({release}) ...")
-    sae_dirs = load_sae_directions(release, device=device)
+    print(f"[{cf}] loading SAE directions ({suite_name}) ...")
+    sae_dirs = load_sae_directions(suite_name, device=device)
 
     print(f"[{cf}] computing post-hoc virtual-weight edges "
           f"(weighting={weighting}, top_k_parents={top_k_parents}) ...")
@@ -628,8 +628,8 @@ if __name__ == "__main__":
                     "from a Part-1 event log.")
     ap.add_argument("--event_log",
                     help="Part-1 event log: event_logs/eventlog/counterfactual=<cf>/")
-    ap.add_argument("--release", default="gpt2-small-res-jb",
-                    help="SAE release (for W_enc/W_dec virtual weights)")
+    ap.add_argument("--suite", default="gpt2-res",
+                    help="SAE suite (for W_enc/W_dec virtual weights); see src/models/suites.py")
     ap.add_argument("--out_dir", default="nets")
     ap.add_argument("--weighting", choices=["upstream", "virtual"], default="upstream")
     ap.add_argument("--top_k_parents", type=int, default=3,
@@ -648,7 +648,7 @@ if __name__ == "__main__":
     if args.selftest or not args.event_log:
         _selftest()
     else:
-        run(args.event_log, args.release, args.out_dir,
+        run(args.event_log, args.suite, args.out_dir,
             weighting=args.weighting,
             top_k_parents=(None if args.top_k_parents == 0 else args.top_k_parents),
             screen_edges_enabled=not args.no_edge_screen,
