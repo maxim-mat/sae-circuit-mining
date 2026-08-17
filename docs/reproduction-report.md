@@ -1,9 +1,31 @@
 # Reproduction report — Marks et al. RC circuit
 
-**Status: smoke-tested, full run NOT YET DONE.** The pipeline runs end to end on
-a 5-example smoke configuration (see below), but the 100-example reproduction has
-not been executed. The results table below is still empty on purpose rather than
-filled with smoke-test numbers, which are not comparable to Marks'.
+**Status: REPRODUCED.** The 100-example run matches the one published
+(threshold, node-count, faithfulness) triple to within 2 nodes and 0.03
+faithfulness. See `docs/ha-vs-marks.md` for the phase-2 comparison built on it.
+
+## Result — 2026-08-17, n=100, T_N=0.1, T_E=0.01, aggregation none
+
+| Quantity | Marks (target) | Ours | Δ |
+|---|---|---|---|
+| Faithfulness | **0.21** | **0.2388** | +0.029 |
+| Node count | **86** | **84** | −2 |
+| Edge count | not published per-circuit | 323 | — |
+| Completeness | not published per-circuit | −0.0221 (ideal 0) | — |
+| F(C) | — | +0.3806 | — |
+| F(M) | — | +1.6189 | — |
+| F(∅) | — | −0.0078 | — |
+
+Source: wandb `maxim0/SAE`, group `marks-repro-rc`, run `marks-threshold-rc-n100`
+(`oobc2bhj`). Target: paper §3.3 ("a circuit with 86 nodes and faithfulness
+0.21") plus the Fig. 7 caption pinning that circuit to T_N=0.1 / T_E=0.01 — the
+only place a threshold, a node count and a faithfulness appear together.
+**Fig. 3 is not a check on this**: it is indexed by node count with the threshold
+swept away, and its bold line averages the four structures.
+
+Reproduced independently on a second machine from the same seed: 1,345,653 node
+rows against the remote run's 1,345,680 (0.002% apart, float nondeterminism at
+the activation mask boundary), same mean total effect to 5 decimals.
 
 ## Smoke run — 2026-08-17, 5 examples, **after** the loader fix
 
@@ -123,28 +145,6 @@ python -m pytest tests/test_end_to_end.py -v -m slow  # ~2 min, 5 examples
 
 ---
 
-## Results
-
-| Quantity | Marks (target) | Ours (measured) | Δ |
-|---|---|---|---|
-| Faithfulness | **0.21** | | |
-| Node count | **86** | | |
-| Edge count | not published per-circuit | | — |
-| F(C) | — | | — |
-| F(M) | — | | — |
-| F(∅) | — | | — |
-
-**Acceptance:** faithfulness within 0.1 of 0.21, with the edge set built from
-`edges.template=marks` so edge topology is comparable at all.
-
-### Per-site node counts
-
-| ordinal | kind | block | selected nodes |
-|---|---|---|---|
-| | | | |
-
----
-
 ## Known divergences
 
 Carried from `docs/reference-numbers.md` §"Known divergences" — metric sign
@@ -153,21 +153,21 @@ Carried from `docs/reference-numbers.md` §"Known divergences" — metric sign
 BOS convention, and edge-position summation. Plus the gaps recorded in
 `docs/spec.md` §2: G7 (no `_pe_exact` ground truth) remains open.
 
-## If the number misses
+## Diagnostics, retained for the remaining structures
 
-Ranked diagnostic candidates, most likely first:
+The reproduction landed, and two of the originally-ranked suspects were resolved
+in the process:
 
-1. **Processed-SAE mismatch.** `ctigges/pythia-70m-deduped__*_processed` are
-   folded/normalised conversions of their `dictionary_learning` dictionaries.
-   Step 0 above is exactly this check; compare against the Tables 4–6 rows in
-   `docs/reference-numbers.md` site by site, not just against the 0.80 floor.
-2. **Hook placement.** Their `attn` is `layer.attention`'s output and `mlp` is
-   `layer.mlp`'s; ours are `hook_attn_out` / `hook_mlp_out`.
-3. **Stop-gradient coverage in the edge template.** Compare
-   `marks_template(build_suite("pythia-marks"))` against `circuit.py`'s
-   per-layer emission order edge by edge.
-4. **IG step grid or batching** — see divergence 2.
-5. **The evaluated segment.** `evaluation.start_layer` defaults to
-   `ceil(n_blocks/3)` = 2, reproducing their "latter 2/3" rule. A faithfulness
-   number that looks far too high or low is worth re-checking here first, since
-   it moves the denominator as well as the numerator.
+1. ~~Processed-SAE mismatch~~ — **eliminated.** Marks' original
+   `dictionary_learning` .pt scores identically to the `ctigges` conversion
+   (0.7338 / L0 136.1 at attn 4, four decimals). See `docs/reference-numbers.md`.
+2. ~~Model loading~~ — **was a real defect, fixed.** TransformerLens weight
+   processing cost `blocks.3.hook_resid_post` 15 points of variance explained;
+   the model is now reconstituted from the SAEs' own metadata.
+3. **Hook placement** — still unverified. Their `attn` is `layer.attention`'s
+   output and `mlp` is `layer.mlp`'s; ours are `hook_attn_out` / `hook_mlp_out`.
+4. **IG step grid** — paper prose and their code disagree on interpolation
+   direction; ours follows the code (docs/spec.md §2).
+5. **The evaluated segment** — `evaluation.start_layer` defaults to
+   `ceil(n_blocks/3)` = 2, reproducing their "latter 2/3" rule. Check first if a
+   faithfulness number looks far off: it moves numerator and denominator both.
