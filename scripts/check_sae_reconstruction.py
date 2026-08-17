@@ -37,13 +37,30 @@ def parse_args():
     p.add_argument("--n-seqs", type=int, default=50)
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out", type=Path, default=Path("docs/reference-numbers.md"))
+    # Its own file, overwritten per run: prepending into a curated document
+    # duplicates that document's headings and grows it without bound.
+    p.add_argument("--out", type=Path, default=Path("docs/sae-reconstruction.md"))
+    # GPU courtesy: this is a diagnostic, not a training job, and it should not
+    # evict whatever else is resident. One sequence at a time keeps the working
+    # set at seq_len x d_model per site; the allocator cap is a hard ceiling in
+    # case a future edit forgets that.
+    p.add_argument("--gpu-mem-fraction", type=float, default=0.25,
+                   help="Cap this process's share of GPU memory (0 = uncapped).")
+    # The BOS position carries an enormous, atypical activation that SAEs
+    # reconstruct badly; including it depresses variance explained at every site
+    # and is not what published SAE evaluations report.
+    p.add_argument("--keep-bos", action="store_true",
+                   help="Score the BOS position too (default: skip it).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
+    if args.device.startswith("cuda") and args.gpu_mem_fraction > 0:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_fraction)
+        logger.info("GPU memory capped at %.0f%% of device",
+                    args.gpu_mem_fraction * 100)
 
     from datasets import load_dataset
 
@@ -70,6 +87,8 @@ def main():
             for site in suite.sites:
                 sae = saes[site.sae_id]
                 x = cache[site.hook]
+                if not args.keep_bos:
+                    x = x[:, 1:, :]
                 f = sae.encode(x)
                 x_hat = sae.decode(f)
                 s = stats[site.sae_id]
@@ -93,7 +112,8 @@ def main():
         f"## Q1 — SAE reconstruction, suite `{args.suite}`",
         "",
         f"{args.n_seqs} sequences x {args.seq_len} tokens from `{args.dataset}`, "
-        f"seed {args.seed}. Acceptance: variance explained >= {VE_FLOOR:.2f}.",
+        f"seed {args.seed}, BOS position {'included' if args.keep_bos else 'skipped'}. "
+        f"Acceptance: variance explained >= {VE_FLOOR:.2f}.",
         "",
         "| ordinal | kind | block | sae_id | variance explained | mean L0 |",
         "|---|---|---|---|---|---|",
@@ -106,8 +126,7 @@ def main():
               if failures else "**PASS** — every site is above the floor.", ""]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    existing = args.out.read_text(encoding="utf-8") if args.out.exists() else ""
-    args.out.write_text("\n".join(lines) + "\n" + existing, encoding="utf-8")
+    args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
     if failures:
         raise SystemExit(

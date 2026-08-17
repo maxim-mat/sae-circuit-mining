@@ -30,12 +30,13 @@ end to end.
 steps against their 100 and 10, evaluated on 5 test examples against their 40.
 The agreement in magnitude is encouraging, not evidence.
 
-**Note on the metric's sign.** `sva_logit_diff` is `logit(patch) − logit(clean)`,
-which is *negative* when the model is behaving correctly on a clean input —
-hence F_M = −1.94 (the model prefers the clean answer by 1.94 logits) sitting
-*below* F_∅ = −0.80. Faithfulness is a ratio of two differences, so the global
-sign cancels and 0.179 is unaffected; see divergence 1 in
-`docs/reference-numbers.md`.
+**Superseded sign convention.** This run predates the metric flip. At the time
+`sva_logit_diff` was `logit(patch) − logit(clean)`, which is *negative* when the
+model behaves correctly, hence F_M = −1.94 sitting *below* F_∅ = −0.80.
+`sva_logit_diff` now returns `clean − patch` (Marks' notebook / Wang et al.),
+so a rerun reports the same faithfulness **0.179** with all three terms
+positive: F_M = +1.94, F_∅ = +0.80, F_C = +1.00, and `total_effect` negative
+rather than positive. The ratio is unchanged because the global sign cancels.
 
 **Targets** come from `docs/reference-numbers.md` (arXiv:2403.19647v3 §3.3 and
 Fig. 7).

@@ -84,20 +84,76 @@ acceptance floor. **L0 varies by two orders of magnitude across sites** — MLP 
 sits at 5 — so "L0 in the tens to low hundreds" is a suite-level sanity band, not
 a per-site test: compare each site against its own row above.
 
-**Not yet measured.** Run
-`python -m scripts.check_sae_reconstruction --suite pythia-marks`; it prepends
-its results table to this file.
+### Measured, 2026-08-17 — **GATE NOT PASSED**
+
+`python -m scripts.check_sae_reconstruction --suite pythia-marks --n-seqs 32`
+(32 x 128 tokens of `NeelNanda/pile-10k`, seed 42, BOS position skipped). Full
+table in `docs/sae-reconstruction.md`; the comparison against their rows:
+
+| Site | Marks VE | ours | Δ | Marks L0 | ours |
+|---|---|---|---|---|---|
+| Attn 0 | 92% | 0.905 | −1.5 | 128 | 132 |
+| Attn 1 | 87% | 0.819 | −5.1 | 127 | 127 |
+| Attn 2 | 90% | 0.880 | −2.0 | 215 | 221 |
+| Attn 3 | 89% | 0.860 | −3.0 | 169 | 172 |
+| **Attn 4** | 83% | **0.733** | **−9.7** | 132 | 137 |
+| Attn 5 | 89% | 0.819 | −7.2 | 144 | 168 |
+| MLP 0 | 97% | 0.968 | −0.2 | 5 | 130 |
+| MLP 1 | 85% | 0.834 | −1.6 | 69 | 69 |
+| MLP 2 | 99% | 0.976 | −1.5 | 88 | 91 |
+| MLP 3 | 88% | 0.814 | −6.6 | 160 | 136 |
+| MLP 4 | 92% | 0.885 | −3.5 | 100 | 93 |
+| MLP 5 | 96% | 0.919 | −4.1 | 102 | 164 |
+| Resid 0 | 92% | 0.908 | −1.3 | 59 | 64 |
+| Resid 1 | 85% | 0.808 | −4.2 | 54 | 63 |
+| Resid 2 | 96% | 0.946 | −1.4 | 108 | 111 |
+| **Resid 3** | 96% | **0.790** | **−17.0** | 68 | 67 |
+| Resid 4 | 88% | 0.833 | −4.7 | 61 | 61 |
+| Resid 5 | 90% | 0.860 | −4.0 | 72 | 98 |
+| embed | (not tabled) | 0.964 | — | — | 5 |
+
+**Two sites fall below the 0.80 floor: `blocks.3.hook_resid_post` (0.790) and
+`blocks.4.hook_attn_out` (0.733).** Per the plan's own gate, the reproduction
+run should not be trusted until this is understood.
+
+Reading of the result:
+
+- **Not a BOS artifact.** Re-measured with the BOS position included and it
+  moves nothing (0.7900 → 0.7953 at resid 3). Ruled out.
+- **Not the wrong dictionaries.** L0 tracks their tables closely at most sites,
+  and at resid 3 almost exactly (67 vs 68) — the site with the *worst*
+  reconstruction has the *right* sparsity. That points at a normalisation or
+  folding difference in the `_processed` conversion, or at the evaluation
+  distribution, rather than a loading error.
+- **A uniform −1 to −5 shortfall is expected** and not alarming: this is 4k
+  tokens of pile-10k against whatever corpus they evaluated on, and variance
+  explained is computed here against a per-sequence mean.
+- **Resid 3 is the outlier that matters.** −17 points, against its neighbours
+  resid 2 (−1.4) and resid 4 (−4.7). Attn 4 at −9.7 is second.
+- **Two L0 discrepancies worth a look**: MLP 0 (theirs 5, ours 130) and MLP 5
+  (theirs 102, ours 164). Note our embed site measures L0 = 5, the same
+  anomalous value their table reports for MLP 0 — possibly a coincidence,
+  possibly an index-mapping question in the `ctigges` release.
+
+Suggested next diagnostic: load `blocks.3.hook_resid_post` from the original
+`dictionary_learning` `.pt` dictionary and compare variance explained on the
+same 32 sequences. That distinguishes "the processed conversion is lossy at this
+site" from "our evaluation differs from theirs".
 
 ---
 
 ## Known divergences to carry into the reproduction report
 
-1. **Metric sign.** The paper (§2) defines `m = log P(patch_answer) −
-   log P(clean_answer)`, which is what `sva_logit_diff` implements. Their
-   notebook's `metric_fn` is the negation (`clean − patch`). Both faithfulness
-   (a ratio in which the sign cancels) and `|IE| > T` selection are invariant to
-   this, so it changes no reported quantity — but every individual IE printed
-   from their notebook has the opposite sign to ours.
+1. **Metric sign — resolved, no longer a divergence.** The paper (§2) defines
+   `m = log P(patch_answer) − log P(clean_answer)`; their notebook's `metric_fn`
+   is the negation (`clean − patch`). `sva_logit_diff` now follows the
+   **notebook**, since that is the code that produced the published numbers and
+   it is the orientation under which "higher is better" actually holds — the
+   same convention as Wang et al. 2023, *Interpretability in the Wild*
+   (arXiv:2211.00593), `logit(correct) − logit(incorrect)`. Both faithfulness (a
+   ratio in which the sign cancels) and `|IE| > T` selection are invariant, so
+   no reported quantity moves; only the sign of individual IEs and of
+   `total_effect` does.
 2. **IG interpolation direction.** The paper writes the gradient as evaluated at
    `α·a_clean + (1−α)·a_patch` with `α ∈ {0, 1/N, …, (N−1)/N}`, i.e. the
    patch end is sampled and the clean end omitted. Our implementation (verified
