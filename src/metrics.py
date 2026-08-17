@@ -6,6 +6,20 @@ reported. The previous (value, direction) convention multiplied the effect
 AFTER the gradient, which is only equivalent for direction = +/-1 and has no
 counterpart in Marks et al. (arXiv:2403.19647) -- they put the sign inside the
 metric, before backprop.
+
+**Sign convention: higher = the behaviour of interest**, i.e. every metric is
+`logit(correct) - logit(incorrect)` on the clean input. This matches the
+logit-difference convention of Wang et al. 2023, "Interpretability in the Wild"
+(arXiv:2211.00593), and Marks' own `experiments/faithfulness.ipynb`, whose
+metric_fn is `-logit(patch_answer) + logit(clean_answer)`.
+
+Note their *paper* (§2) writes the opposite orientation, `log P(patch) -
+log P(clean)`. Both orientations appear in the literature and neither is wrong;
+we follow their code, since that is what produced the published numbers, and it
+is the one under which "higher is better" actually holds. Nothing downstream
+depends on the choice: faithfulness is a ratio of two differences in m, and node
+selection thresholds |IE|, so a global sign flip cancels in both. It only
+determines whether individual IEs read as positive or negative.
 """
 from __future__ import annotations
 
@@ -13,11 +27,17 @@ import torch
 
 
 def sva_logit_diff(logits, example, model, **_):
-    """Marks' paired subject-verb agreement metric:
-    logit(patch_answer) - logit(clean_answer), read at the final position."""
-    correct = model.to_single_token(example.patch_answer)
+    """Marks' paired subject-verb agreement metric, in their notebook's
+    orientation: logit(clean_answer) - logit(patch_answer), read at the final
+    position.
+
+    On a clean input the model should prefer the clean answer, so a
+    well-behaved model scores POSITIVE here, and mean-ablating the network pulls
+    the score toward zero.
+    """
     clean = model.to_single_token(example.clean_answer)
-    return logits[0, -1, correct] - logits[0, -1, clean]
+    patch = model.to_single_token(example.patch_answer)
+    return logits[0, -1, clean] - logits[0, -1, patch]
 
 
 def mib_logit_diff(logits, example, model, **_):

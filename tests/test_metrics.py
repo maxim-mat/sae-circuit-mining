@@ -9,14 +9,26 @@ class FakeModel:
         return {" is": 5, " are": 7, " Mary": 5, " John": 7}[s]
 
 
-def test_sva_logit_diff_is_patch_minus_clean_at_last_position():
-    """Marks' paired metric: logit(patch_answer) - logit(clean_answer)."""
+def test_sva_logit_diff_is_clean_minus_patch_at_last_position():
+    """Marks' notebook orientation: logit(clean_answer) - logit(patch_answer),
+    so that higher = the behaviour of interest (Wang et al. arXiv:2211.00593)."""
     logits = torch.zeros(1, 4, 10)
     logits[0, -1, 5] = 2.0    # clean answer " is"
     logits[0, -1, 7] = 3.0    # patch answer " are"
     ex = Example("the boy", " is", "the boys", " are")
     m = get_metric("sva_logit_diff")(logits=logits, example=ex, model=FakeModel())
-    assert m.item() == pytest.approx(1.0)
+    assert m.item() == pytest.approx(-1.0)
+
+
+def test_a_correct_model_scores_positive_on_a_clean_input():
+    """The sign that matters in practice: preferring the clean answer must be
+    positive, or F(M) lands below F(empty) and every IE reads backwards."""
+    logits = torch.zeros(1, 4, 10)
+    logits[0, -1, 5] = 3.0    # clean answer " is" preferred
+    logits[0, -1, 7] = 1.0    # patch answer " are"
+    ex = Example("the boy", " is", "the boys", " are")
+    m = get_metric("sva_logit_diff")(logits=logits, example=ex, model=FakeModel())
+    assert m.item() > 0
 
 
 def test_sva_metric_reads_only_the_last_position():
