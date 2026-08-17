@@ -116,7 +116,7 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
     handle_errors: "keep" never ablates the error term, "remove" always does,
     "default" lets the mask decide. Sites before start_layer are left untouched.
     """
-    if handle_errors not in ("default", "keep", "remove"):
+    if handle_errors not in ("default", "keep", "remove", "resid_only"):
         raise ValueError(f"Unknown handle_errors {handle_errors!r}")
     first_block = resolve_start_layer(suite, start_layer)
     ablated_sites = [s for s in suite.sites if s.block >= first_block]
@@ -175,6 +175,11 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
             if handle_errors == "keep":
                 err_keep = torch.ones_like(err_keep)
             elif handle_errors == "remove":
+                err_keep = torch.zeros_like(err_keep)
+            elif handle_errors == "resid_only" and site.kind != "resid":
+                # Marks' features_wo_some_errs: drop attn/MLP error nodes, leave
+                # the resid ones to the mask. Their notebook zeroes resc for any
+                # submodule whose name lacks "resid".
                 err_keep = torch.zeros_like(err_keep)
             new_err = torch.where(err_keep.unsqueeze(-1), err, err_ref)
             return sae.decode(new_feats) + new_err

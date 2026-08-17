@@ -16,6 +16,7 @@ import pandas as pd
 from src.attribution.nodes import read_node_hive
 from src.calibrated_feature_selection import calibrated_feature_cols, select_calibrated
 from src.selection.aggregate import aggregate
+from src.selection.baselines import select_random, select_screen_magnitude
 from src.selection.threshold import select_by_threshold
 
 logger = logging.getLogger(__name__)
@@ -91,10 +92,17 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
         if summary is not None:
             stage_summary = {f"screen_{k}": float(v) for k, v in summary.items()}
             logger.info("Calibrated stages: %s", dict(summary))
+    elif cfg.selection.method == "random":
+        nodes = select_random(nodes, cfg.selection.k, cfg.seed)
+    elif cfg.selection.method == "screen_magnitude":
+        nodes = select_screen_magnitude(
+            raw, nodes, calibrated_feature_cols(cfg), cfg.selection.k,
+            cfg.selection.screen_q, cfg.selection.screen_n0,
+            cfg.selection.screen_pool_col)
     else:
         raise ValueError(
-            f"Unknown selection method {cfg.selection.method!r}; "
-            f"expected 'threshold' or 'calibrated'")
+            f"Unknown selection method {cfg.selection.method!r}; expected one of "
+            f"'threshold', 'calibrated', 'screen_magnitude', 'random'")
 
     nodes.to_parquet(out_dir / "nodes.parquet", compression="zstd", index=False)
     n_selected = int(nodes["selected"].sum())

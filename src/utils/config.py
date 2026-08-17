@@ -50,8 +50,17 @@ class AttributionConfig:
 @dataclass
 class SelectionConfig:
     aggregation: str = "none"    # "none" | "sum"  (Marks App. A.2)
-    method: str = "threshold"    # "threshold" | "calibrated"
+    # "threshold"        -- Marks: |mean IE| > node_threshold
+    # "calibrated"       -- screen + recurrence test (the HA arm)
+    # "screen_magnitude" -- screen + rank by sum|IE|, no significance test.
+    #                       Decomposes the HA arm: if this matches "calibrated",
+    #                       the Stage-1 screen is doing the work, not the test.
+    # "random"           -- uniform k nodes, the floor every other arm must beat
+    method: str = "threshold"
     node_threshold: float = 0.1
+    # "random" and "screen_magnitude": how many nodes to select. Sweep it to
+    # trace a curve at the same node counts the other arms produce.
+    k: int = 100
     # calibrated-only. The two rates are NOT the same knob:
     #   screen_q -- Stage 1, expected false positives per (example, site) group,
     #               which sets the per-group noise floor c_g.
@@ -103,7 +112,12 @@ class EvalConfig:
     # batched forward, so this is bounded by memory, not just time.
     num_examples: Optional[int] = 100
     ablation: str = "mean"             # "mean" | "resample" | "zero"
-    handle_errors: str = "default"     # "default" | "keep" | "remove"
+    # Marks' four SAE-error treatments, which are the separate lines of their
+    # Fig. 3: "default" lets the circuit mask decide (features), "remove"
+    # ablates every error node (features_wo_errs), "resid_only" ablates attn and
+    # MLP errors but leaves resid ones to the mask (features_wo_some_errs), and
+    # "keep" never ablates an error term.
+    handle_errors: str = "default"     # "default" | "keep" | "remove" | "resid_only"
     start_layer: int = -1
     # Per-node leave-one-out necessity (Wang et al. arXiv:2211.00593 section 4.2,
     # approximated with K={}). Costs one forward pass per circuit node, so it is
