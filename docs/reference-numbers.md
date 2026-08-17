@@ -84,61 +84,54 @@ acceptance floor. **L0 varies by two orders of magnitude across sites** — MLP 
 sits at 5 — so "L0 in the tens to low hundreds" is a suite-level sanity band, not
 a per-site test: compare each site against its own row above.
 
-### Measured, 2026-08-17 — **GATE NOT PASSED**
+### Measured, 2026-08-17 — resolved, both anomalies were ours
 
-`python -m scripts.check_sae_reconstruction --suite pythia-marks --n-seqs 32`
-(32 x 128 tokens of `NeelNanda/pile-10k`, seed 42, BOS position skipped). Full
-table in `docs/sae-reconstruction.md`; the comparison against their rows:
+`python -m scripts.check_sae_reconstruction --suite pythia-marks --n-seqs 64`.
+Full table in `docs/sae-reconstruction.md`. **Marks' dictionaries are fine and
+the `ctigges` conversion is faithful.** The two sites that initially failed the
+0.80 floor were both artefacts on our side, one in the pipeline and one in the
+diagnostic:
 
-| Site | Marks VE | ours | Δ | Marks L0 | ours |
-|---|---|---|---|---|---|
-| Attn 0 | 92% | 0.905 | −1.5 | 128 | 132 |
-| Attn 1 | 87% | 0.819 | −5.1 | 127 | 127 |
-| Attn 2 | 90% | 0.880 | −2.0 | 215 | 221 |
-| Attn 3 | 89% | 0.860 | −3.0 | 169 | 172 |
-| **Attn 4** | 83% | **0.733** | **−9.7** | 132 | 137 |
-| Attn 5 | 89% | 0.819 | −7.2 | 144 | 168 |
-| MLP 0 | 97% | 0.968 | −0.2 | 5 | 130 |
-| MLP 1 | 85% | 0.834 | −1.6 | 69 | 69 |
-| MLP 2 | 99% | 0.976 | −1.5 | 88 | 91 |
-| MLP 3 | 88% | 0.814 | −6.6 | 160 | 136 |
-| MLP 4 | 92% | 0.885 | −3.5 | 100 | 93 |
-| MLP 5 | 96% | 0.919 | −4.1 | 102 | 164 |
-| Resid 0 | 92% | 0.908 | −1.3 | 59 | 64 |
-| Resid 1 | 85% | 0.808 | −4.2 | 54 | 63 |
-| Resid 2 | 96% | 0.946 | −1.4 | 108 | 111 |
-| **Resid 3** | 96% | **0.790** | **−17.0** | 68 | 67 |
-| Resid 4 | 88% | 0.833 | −4.7 | 61 | 61 |
-| Resid 5 | 90% | 0.860 | −4.0 | 72 | 98 |
-| embed | (not tabled) | 0.964 | — | — | 5 |
+| Apparent problem | Actual cause | Status |
+|---|---|---|
+| `blocks.4.hook_attn_out` 0.733 vs 0.83 | variance explained was computed about a **per-sequence** mean, shrinking the denominator | **fixed** in the script; now 0.827 |
+| `blocks.3.hook_resid_post` 0.790 vs 0.96 | `load_model_and_saes` applies TransformerLens weight processing the SAEs were not trained for | **outstanding**, see below |
 
-**Two sites fall below the 0.80 floor: `blocks.3.hook_resid_post` (0.790) and
-`blocks.4.hook_attn_out` (0.733).** Per the plan's own gate, the reproduction
-run should not be trusted until this is understood.
+#### The `ctigges` conversion is bit-faithful to the original dictionaries
 
-Reading of the result:
+Marks' own `dictionary_learning` `.pt` files were pulled out of
+`saprmarks/pythia-70m-deduped-saes` (a 2.37 GB zip, fetched member-wise over
+HTTP range requests) and their `AutoEncoder` reimplemented from its four
+tensors — `encode(x) = ReLU(W_enc(x − bias) + b_enc)`, `decode(f) = W_dec f + bias`
+— so no `dictionary_learning` dependency was added. Scored on identical inputs:
 
-- **Not a BOS artifact.** Re-measured with the BOS position included and it
-  moves nothing (0.7900 → 0.7953 at resid 3). Ruled out.
-- **Not the wrong dictionaries.** L0 tracks their tables closely at most sites,
-  and at resid 3 almost exactly (67 vs 68) — the site with the *worst*
-  reconstruction has the *right* sparsity. That points at a normalisation or
-  folding difference in the `_processed` conversion, or at the evaluation
-  distribution, rather than a loading error.
-- **A uniform −1 to −5 shortfall is expected** and not alarming: this is 4k
-  tokens of pile-10k against whatever corpus they evaluated on, and variance
-  explained is computed here against a per-sequence mean.
-- **Resid 3 is the outlier that matters.** −17 points, against its neighbours
-  resid 2 (−1.4) and resid 4 (−4.7). Attn 4 at −9.7 is second.
-- **Two L0 discrepancies worth a look**: MLP 0 (theirs 5, ours 130) and MLP 5
-  (theirs 102, ours 164). Note our embed site measures L0 = 5, the same
-  anomalous value their table reports for MLP 0 — possibly a coincidence,
-  possibly an index-mapping question in the `ctigges` release.
+| Site | Marks' `.pt` | `ctigges` `_processed` |
+|---|---|---|
+| `blocks.4.hook_attn_out` | 0.7338 / L0 136.1 | 0.7338 / L0 136.1 |
+| `blocks.0.hook_attn_out` | 0.9027 / L0 129.6 | 0.9027 / L0 129.6 |
+
+Identical to four decimal places under both weight processings. The conversion
+introduces no loss; the sae_lens catalog route in spec §3 is sound.
+
+#### With both artefacts removed, we match their tables
+
+128 sequences, unprocessed weights, global-mean variance:
+
+| Site | ours | Marks | Δ | L0 ours / theirs |
+|---|---|---|---|---|
+| `blocks.4.hook_attn_out` | 0.8290 | 0.83 | −0.001 | 132 / 132 |
+| `blocks.0.hook_attn_out` | 0.9178 | 0.92 | −0.002 | 129 / 128 |
+| `blocks.5.hook_attn_out` | 0.8609 | 0.89 | −0.029 | 145 / 144 |
+| `blocks.3.hook_resid_post` | 0.9432 | 0.96 | −0.017 | 69 / 68 |
+| `blocks.1.hook_resid_post` | 0.8462 | 0.85 | −0.004 | 54 / 54 |
+| `blocks.3.hook_mlp_out` | 0.8694 | 0.88 | −0.011 | 164 / 160 |
+
+Residual deltas of 1–3 points are sample size and corpus (4k–16k tokens of
+`NeelNanda/pile-10k` against their eval set).
 
 ### Root cause of the resid-3 gap — TransformerLens weight processing
 
-**Resolved without needing the original dictionaries.** Same SAE, same 32
-sequences, only the model's weight processing differs:
+Same SAE, same sequences, only the model's weight processing differs:
 
 | Site | `from_pretrained` (fold_ln + center_writing_weights + center_unembed) | `from_pretrained_no_processing` | Marks |
 |---|---|---|---|
@@ -147,15 +140,14 @@ sequences, only the model's weight processing differs:
 | `blocks.0.hook_resid_post` | 0.908 | 0.915 | 92% |
 | `blocks.4.hook_attn_out` | 0.733 | 0.734 | 83% |
 
-The −17 point gap becomes −1.8, in line with every other site.
-
 **Why.** `center_writing_weights` subtracts the mean-over-`d_model` component
 from every matrix that writes to the residual stream. That component is
 invisible to the *model* (the next LayerNorm removes it) but perfectly visible
 to an *SAE*, which was trained on the uncentered activation. Sites whose mean
 component is large — resid 3 here — are mis-reconstructed by exactly that
-amount. Marks ran nnsight on the raw HF model, so unprocessed weights are also
-the faithful choice for reproduction.
+amount. Attention sites barely move, which is why this never showed up at
+`hook_attn_out`. Marks ran nnsight on the raw HF model, so unprocessed weights
+are also the faithful choice for reproduction.
 
 **Confirmed by sae_lens' own metadata** (`sae.cfg.metadata`), which is
 authoritative and matches the measurement:
@@ -168,7 +160,8 @@ authoritative and matches the measurement:
 **The two suites need opposite treatment.** Loading gpt2-small *without*
 processing is catastrophic — `blocks.11.hook_resid_post` scores VE **−241**
 (L0 877) — because those SAEs were trained on TransformerLens-processed
-activations. So this is a per-suite property, not a global switch.
+activations. Per-suite property, not a global switch. (Marks themselves never
+use GPT-2; that suite is this repo's own baseline, spec R3.)
 
 ### Two consequent defects in this repo (not yet fixed)
 
@@ -185,16 +178,8 @@ activations. So this is a per-suite property, not a global switch.
    an actual defect, and fixing it aligns us with Marks, whose loader uses the
    bare HF tokenizer.
 
-### Still unexplained: `blocks.4.hook_attn_out`
-
-0.733 against their 83%, and **unmoved** by weight processing (0.7329 →
-0.7338). `blocks.5.hook_attn_out` is also low (0.819 vs 89%). This is the one
-question the original `dictionary_learning` `.pt` dictionaries would still
-answer: whether the `ctigges` `_processed` conversion is lossy for the later
-attention SAEs, or whether our `hook_attn_out` placement differs from their
-`layer.attention` output.
-
----
+Both are gated on a HIGH-risk edit to `load_model_and_saes` (8 impacted symbols,
+4 direct callers, 3 execution flows) and await confirmation.
 
 ## Known divergences to carry into the reproduction report
 

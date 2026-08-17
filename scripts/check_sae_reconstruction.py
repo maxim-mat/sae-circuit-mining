@@ -76,7 +76,13 @@ def main():
 
     # Accumulate over sequences rather than concatenating activations: 50 x 128
     # tokens x d_model x 19 sites does not need to be resident at once.
-    stats = {site.sae_id: {"sq_err": 0.0, "sq_dev": 0.0, "l0": 0.0, "n": 0}
+    #
+    # Variance is taken about the GLOBAL mean, via running sum / sum-of-squares.
+    # Centering per sequence instead shrinks the denominator and depresses
+    # variance explained by several points -- that alone made blocks.4.hook_attn_out
+    # read 0.733 against Marks' published 0.83, which is really 0.829.
+    stats = {site.sae_id: {"sq_err": 0.0, "sum_x": None, "sum_x2": None,
+                           "l0": 0.0, "n": 0}
              for site in suite.sites}
 
     for text in texts:
@@ -91,17 +97,23 @@ def main():
                     x = x[:, 1:, :]
                 f = sae.encode(x)
                 x_hat = sae.decode(f)
+                flat = x.reshape(-1, x.shape[-1]).double()
                 s = stats[site.sae_id]
                 s["sq_err"] += float(((x - x_hat) ** 2).sum())
-                s["sq_dev"] += float(((x - x.mean(dim=(0, 1), keepdim=True)) ** 2).sum())
+                sx, sx2 = flat.sum(0), (flat ** 2).sum(0)
+                s["sum_x"] = sx if s["sum_x"] is None else s["sum_x"] + sx
+                s["sum_x2"] = sx2 if s["sum_x2"] is None else s["sum_x2"] + sx2
                 s["l0"] += float((f > 0).float().sum(-1).sum())
-                s["n"] += x.shape[0] * x.shape[1]
+                s["n"] += flat.shape[0]
 
     rows, failures = [], []
     for site in suite.sites:
         s = stats[site.sae_id]
-        ve = 1.0 - s["sq_err"] / s["sq_dev"] if s["sq_dev"] else float("nan")
-        l0 = s["l0"] / s["n"] if s["n"] else float("nan")
+        n = s["n"]
+        total_var = (float((s["sum_x2"] - s["sum_x"] ** 2 / n).sum())
+                     if n else 0.0)
+        ve = 1.0 - s["sq_err"] / total_var if total_var else float("nan")
+        l0 = s["l0"] / n if n else float("nan")
         rows.append((site, ve, l0))
         if not (ve >= VE_FLOOR):
             failures.append((site.sae_id, ve))
