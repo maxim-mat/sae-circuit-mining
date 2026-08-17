@@ -54,6 +54,15 @@ def _ablation_values(feats: torch.Tensor, style: str) -> torch.Tensor:
     if style == "mean":
         return feats.mean(dim=0, keepdim=True).expand_as(feats)
     if style == "resample":
+        # WARNING for contrastive datasets: this permutes within the PATCH batch,
+        # so an ablated feature receives another example's value -- and in SVA the
+        # patch prefixes are number-flipped, so that value carries a random
+        # subject number. Against a number-agreement metric that injects the
+        # wrong answer about half the time, making this an adversarial
+        # substitution rather than a neutral one. It is why F(C) collapses and
+        # goes negative here while mean ablation gives ~0.2, and why Wang et al.
+        # ablate on a THIRD distribution (p_ABC, three unrelated names) instead of
+        # permuting within their paired set. Use "mean" for the reproduction.
         perm = torch.randperm(feats.shape[0], device=feats.device)
         return feats[perm]
     if style == "zero":
@@ -83,7 +92,13 @@ def build_patch_ref(model, saes, sites, patch_batch, ablation: str) -> dict:
     the minimality sweep calls that function once per circuit node, and
     rebuilding this each time would repeat a full patch forward plus 18 SAE
     encode/decode passes for every node.
+
+    "mean" reduces to [1, seq, d_sae] and stays on the accelerator. "resample"
+    and "zero" keep the full [batch, seq, d_sae] per site, which is 3.1GB at
+    batch 4000 and will not fit 19 times over in 24GB of VRAM -- those are held
+    in host memory and paged in per hook instead.
     """
+    offload = ablation != "mean"
     with torch.no_grad():
         _, cache = model.run_with_cache(patch_batch,
                                         names_filter=[s.hook for s in sites])
@@ -92,8 +107,11 @@ def build_patch_ref(model, saes, sites, patch_batch, ablation: str) -> dict:
         sae = saes[site.sae_id]
         x = cache[site.hook]
         f = sae.encode(x)
-        ref[site.hook] = (_ablation_values(f, ablation),
-                          _ablation_values(x - sae.decode(f), ablation))
+        pair = (_ablation_values(f, ablation),
+                _ablation_values(x - sae.decode(f), ablation))
+        if offload:
+            pair = tuple(v.detach().to("cpu") for v in pair)
+        ref[site.hook] = pair
     return ref
 
 
@@ -149,6 +167,8 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
             err = tensor - recon
 
             ref, err_ref = patch_ref[site.hook]
+            if ref.device != feats.device:          # paged from host memory
+                ref, err_ref = ref.to(feats.device), err_ref.to(feats.device)
             seq = feats.shape[1]
             if keep_mask is None:
                 new_feats = feats
@@ -271,15 +291,29 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
 
     keep_mask = build_keep_mask(circuit.nodes)
 
-    base = dict(ablation=cfg.evaluation.ablation,
-                handle_errors=cfg.evaluation.handle_errors,
+    base = dict(handle_errors=cfg.evaluation.handle_errors,
                 device=cfg.suite.device, prepend_bos=prepend_bos)
 
-    # F(M) ablates nothing, so it does not depend on start_layer.
-    f_m = run_with_ablations(model, saes, suite, examples, None, metric_fn, **base)
+    patch_batch = torch.cat(
+        [model.to_tokens(ex.patch_prefix, prepend_bos=prepend_bos) for ex in examples]
+    ).to(cfg.suite.device)
 
-    def evaluate_at(start_layer: int) -> dict:
-        common = dict(base, start_layer=start_layer)
+    # F(M) ablates nothing, so it depends on neither start_layer nor ablation.
+    f_m = run_with_ablations(model, saes, suite, examples, None, metric_fn,
+                             ablation=cfg.evaluation.ablation, **base)
+
+    def evaluate_at(start_layer: int, ablation: str) -> dict:
+        common = dict(base, start_layer=start_layer, ablation=ablation)
+        # ONE ablation draw shared by all three terms. "resample" permutes the
+        # patch batch, so letting each call build its own reference would divide
+        # F(C) by an F(empty) measured under a different intervention -- the
+        # ratio would mix draws and is what produced a negative faithfulness
+        # here. Also deterministic: seeded once from cfg.seed.
+        torch.manual_seed(cfg.seed)
+        sites = [s for s in suite.sites
+                 if s.block >= resolve_start_layer(suite, start_layer)]
+        ref = build_patch_ref(model, saes, sites, patch_batch, ablation)
+        common["patch_ref"] = ref
         f_c = run_with_ablations(model, saes, suite, examples, keep_mask,
                                  metric_fn, **common)
         f_empty = run_with_ablations(model, saes, suite, examples, {},
@@ -292,7 +326,8 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
         return {"F_C": f_c, "F_empty": f_empty, "F_complement": f_complement,
                 "faithfulness": faithfulness(f_c, f_m, f_empty),
                 "completeness": faithfulness(f_complement, f_m, f_empty),
-                "start_layer": resolve_start_layer(suite, start_layer)}
+                "start_layer": resolve_start_layer(suite, start_layer),
+                "ablation": ablation}
 
     # Marks' paper and code disagree about scoring the whole circuit, so report
     # BOTH rather than let a default decide silently:
@@ -302,13 +337,18 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     #          which keeps every block                  -> start_layer = 0
     #          (their faithfulness script also passes include_embed=False, which
     #           our block>=0 filter reproduces, embed carrying block=-1)
-    latter_two_thirds = evaluate_at(-1)
-    all_blocks = evaluate_at(0)
-    primary = evaluate_at(cfg.evaluation.start_layer)
+    # ... crossed with both ablation styles, since mean ablation can leak task
+    # information through the batch mean while resample cannot. If a ranking
+    # holds under one and not the other it is not a ranking.
+    variants = {f"{seg_name}_{abl}": evaluate_at(seg, abl)
+                for seg_name, seg in (("23", -1), ("all", 0))
+                for abl in ("mean", "resample")}
+    primary = evaluate_at(cfg.evaluation.start_layer, cfg.evaluation.ablation)
 
     f_c, f_empty = primary["F_C"], primary["F_empty"]
     f_complement = primary["F_complement"]
-    common = dict(base, start_layer=cfg.evaluation.start_layer)
+    common = dict(base, start_layer=cfg.evaluation.start_layer,
+                  ablation=cfg.evaluation.ablation)
 
     # Position indices only transfer if the eval split tokenises to the same
     # length the circuit was discovered at; use_min_length_only makes that true
@@ -330,9 +370,11 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     result = {
         **primary,
         "F_M": f_m,
-        # Both readings of Marks' inconsistent ⅓ rule, always reported.
-        **{f"{k}_latter_two_thirds": v for k, v in latter_two_thirds.items()},
-        **{f"{k}_all_blocks": v for k, v in all_blocks.items()},
+        # Both readings of Marks' inconsistent ⅓ rule x both ablation styles.
+        **{f"{metric}_{tag}": vals[metric]
+           for tag, vals in variants.items()
+           for metric in ("faithfulness", "completeness", "F_C", "F_empty",
+                          "F_complement")},
         "n_nodes": len(circuit.nodes),
         "n_examples": len(examples),
         "n_nodes_stale": stale,
@@ -354,11 +396,8 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
                     result["minimality_median"],
                     100 * result["minimality_frac_nontrivial"])
     (Path(out_dir) / "faithfulness.json").write_text(json.dumps(result, indent=2))
-    logger.info(
-        "Faithfulness/completeness — latter 2/3 (paper §3.2, from layer %d): "
-        "%.4f / %.4f | all blocks (ablation.py default): %.4f / %.4f "
-        "[F_M=%.4f]",
-        latter_two_thirds["start_layer"],
-        latter_two_thirds["faithfulness"], latter_two_thirds["completeness"],
-        all_blocks["faithfulness"], all_blocks["completeness"], f_m)
+    logger.info("F_M=%.4f | faithfulness/completeness by (segment, ablation): %s",
+                f_m, "  ".join(
+                    f"{tag}={v['faithfulness']:.4f}/{v['completeness']:.4f}"
+                    for tag, v in variants.items()))
     return result
