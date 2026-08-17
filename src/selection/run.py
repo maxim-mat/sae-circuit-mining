@@ -70,6 +70,12 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
     if block_col:
         raw = _attach_example_meta(raw, node_dir, block_col)
 
+    # Per-stage diagnostics from the calibrated path. Without these you cannot
+    # tell whether a large circuit came from a permissive Stage-1 screen or a
+    # permissive Stage-2 test, which is the first question to ask of a bad
+    # selection -- so they go into the manifest and to wandb.
+    stage_summary: dict = {}
+
     if cfg.selection.method == "threshold":
         nodes = select_by_threshold(nodes, cfg.selection.node_threshold)
     elif cfg.selection.method == "calibrated":
@@ -79,6 +85,10 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
         nodes = nodes.merge(feats[FEATURE_COLS + ["selected"]], on=FEATURE_COLS,
                             how="left")
         nodes["selected"] = nodes["selected"].fillna(False).astype(bool)
+        summary = feats.attrs.get("summary")
+        if summary is not None:
+            stage_summary = {f"screen_{k}": float(v) for k, v in summary.items()}
+            logger.info("Calibrated stages: %s", dict(summary))
     else:
         raise ValueError(
             f"Unknown selection method {cfg.selection.method!r}; "
@@ -92,4 +102,5 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
         "n_selected": n_selected,
         "selected_frac": n_selected / len(nodes) if len(nodes) else 0.0,
         "runtime_s": round(time.time() - started, 2),
+        **stage_summary,
     }
