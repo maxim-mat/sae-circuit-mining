@@ -111,13 +111,25 @@ exactly the `singular_plural` and `plural_singular` cases — about half the dat
 Testable now that `case` is in the `examples.parquet` sidecar: completeness
 should be ≈0 on matched cases and clearly negative on mismatched ones.
 
-**Minimality is missing, and it is the criterion most likely to bite.** Wang et
-al. §4.2 argue faithfulness and completeness together are still insufficient:
-every node v ∈ C should have some K with `|F(C \ (K∪{v})) − F(C \ K)|` large. We
-have shown the calibrated circuit is more *sufficient*; we have no evidence it is
-not padded, and it carries 125 nodes to the threshold's 84. Their exact criterion
-needs an exponential subset search, but a per-node leave-one-out is cheap on
-position-resolved nodes.
+**Minimality: worth knowing about, but not a gap in this comparison.** Marks do
+not use it — §3.2 evaluates exactly "interpretability, faithfulness, and
+completeness". It is Wang et al.'s third criterion (§4.2): every node v ∈ C
+should have some K with `|F(C \ (K∪{v})) − F(C \ K)|` large.
+
+Their argument for needing it is that faithfulness and completeness can both be
+satisfied by a padded circuit, and that holds for Marks' pair too — adding
+irrelevant nodes to C removes them from M\C without moving F(M\C), so
+completeness is padding-blind as well. But that bites when circuits are compared
+at face value. The sweep above compares at **matched node count**, which prices
+padding in directly: a padded 125-node circuit would lose to the threshold at 125
+nodes, and it does not.
+
+What minimality would add is a different question — whether each node is
+individually necessary, i.e. whether this is a *mechanism* rather than a
+well-performing set. That matters for interpreting the circuit, not for deciding
+which selector is better. Their exact criterion needs an exponential subset
+search; a per-node leave-one-out is cheap on position-resolved nodes if the
+question becomes interesting.
 
 ## 5. Claims made during this work that did not survive
 
@@ -128,11 +140,16 @@ position-resolved nodes.
 - **"HA fails colossally."** An artifact of the broadcast bug above.
 - **"HA is worse on completeness."** True as raw distance from 0, but presented
   as a deficiency when both circuits are effectively at the ideal.
+- **"Minimality is the missing leg of this comparison."** Imported from Wang et
+  al. into a Marks reproduction, where it does not belong: Marks evaluate
+  interpretability, faithfulness and completeness only. And comparing at matched
+  node count already prices in the padding that minimality guards against.
 
 ## 6. Next
 
 1. Per-`case` completeness breakdown (tests the distractor-fallback story).
-2. Minimality approximation via per-node leave-one-out.
+2. Minimality (per-node leave-one-out) — optional, and only if the claim
+   becomes about the circuit as a mechanism rather than about the selector.
 3. Repeat the sweep on `simple`, `nounpp`, `within_rc` — one claim from one
    dataset is not a result. Node hive is ~3 min per structure.
 4. Grid over `screen_q x fdr_q x min_recurrence x screen_n0`, now that all four
