@@ -54,3 +54,33 @@ def test_error_nodes_survive_aggregation():
 def test_unknown_mode_raises():
     with pytest.raises(ValueError):
         aggregate(_df([]), "median")
+
+
+def test_hive_categorical_partitions_do_not_explode_the_row_count(tmp_path):
+    """Regression: pyarrow returns hive partition keys as Categoricals, and
+    groupby(observed=False) then materialises the full cartesian product of
+    category levels. On a real 5-example run that turned 96,574 rows into
+    58,194,948. src.attribution.nodes.read_node_hive casts them back."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from src.attribution.nodes import NODE_SCHEMA, read_node_hive
+
+    rows = {
+        "example_idx": [0, 0, 1], "site_ordinal": [1, 3, 1], "block": [0, 1, 0],
+        "kind": ["attn", "mlp", "attn"], "token_idx": [0, 1, 0],
+        "token_id": [5, 6, 5], "feature_idx": [7, 9, 7],
+        "attribution": [0.5, 0.25, 0.5],
+    }
+    pq.write_to_dataset(pa.Table.from_pydict(rows, schema=NODE_SCHEMA),
+                        root_path=str(tmp_path / "nodes"),
+                        partition_cols=["kind", "site_ordinal"])
+
+    straight = pd.read_parquet(tmp_path / "nodes")
+    assert isinstance(straight["kind"].dtype, pd.CategoricalDtype), \
+        "if pyarrow stops returning Categoricals this guard is moot"
+    assert len(aggregate(straight, "none")) > 2, "the trap should still be real"
+
+    fixed = read_node_hive(tmp_path)
+    out = aggregate(fixed, "none")
+    assert len(out) == 2, f"expected the 2 real nodes, got {len(out)}"
+    assert set(out["kind"]) == {"attn", "mlp"}

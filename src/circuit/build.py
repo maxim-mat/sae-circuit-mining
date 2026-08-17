@@ -87,7 +87,8 @@ def run_circuit(cfg, node_dir: Path, selection_dir: Path, edge_dir: Path,
 
     edge_path = Path(edge_dir) / "edges"
     if edge_path.exists():
-        raw_edges = pd.read_parquet(edge_path)
+        from src.attribution.edges import read_edge_hive
+        raw_edges = read_edge_hive(edge_dir)
         n_examples = max(len(totals), 1)
         key = ["src_ordinal", "src_feature", "dst_ordinal", "dst_feature"]
         edges = (raw_edges.groupby(key, sort=False)["edge_ie"].sum() / n_examples

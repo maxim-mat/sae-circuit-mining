@@ -23,6 +23,7 @@ import logging
 import time
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
@@ -54,6 +55,25 @@ TOTAL_EFFECT_SCHEMA = pa.schema([
 
 _EMPTY_BATCH = {name: [] for name in NODE_SCHEMA.names}
 CHUNK_SIZE = 10          # examples between parquet flushes
+
+_NODE_DTYPES = {"example_idx": "int32", "site_ordinal": "int16", "block": "int16",
+                "kind": "object", "token_idx": "int16", "token_id": "int32",
+                "feature_idx": "int32", "attribution": "float32"}
+
+
+def read_node_hive(node_dir: Path) -> pd.DataFrame:
+    """Read the node hive with partition columns restored to their real dtypes.
+
+    pyarrow hands hive partition keys back as pandas Categoricals. That is a trap
+    for every groupby downstream: with observed=False (the pandas default)
+    grouping on a Categorical materialises the FULL CARTESIAN PRODUCT of category
+    levels, inventing a zero-valued row for every (kind x site x feature x
+    position) combination that never occurred. On a 5-example run that turned
+    96,574 real rows into 58,194,948. Cast them back here, once, rather than
+    hunting observed=True through every consumer.
+    """
+    df = pd.read_parquet(Path(node_dir) / "nodes")
+    return df.astype({c: t for c, t in _NODE_DTYPES.items() if c in df.columns})
 
 
 def _flush(batch: dict, out_dir: Path) -> int:

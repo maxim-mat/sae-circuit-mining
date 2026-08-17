@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.attribution.nodes import read_node_hive
 from src.calibrated_feature_selection import FEATURE_COLS, select_calibrated
 from src.selection.aggregate import aggregate
 from src.selection.threshold import select_by_threshold
@@ -25,7 +26,7 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
     node_dir, out_dir = Path(node_dir), Path(out_dir)
     started = time.time()
 
-    raw = pd.read_parquet(node_dir / "nodes")
+    raw = read_node_hive(node_dir)
     nodes = aggregate(raw, cfg.selection.aggregation)
 
     if cfg.selection.method == "threshold":

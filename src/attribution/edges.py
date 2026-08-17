@@ -66,6 +66,16 @@ EDGE_SCHEMA = pa.schema([
 
 CHUNK_SIZE = 10          # examples between parquet flushes
 
+_EDGE_DTYPES = {"example_idx": "int32", "src_ordinal": "int16", "src_feature": "int32",
+                "dst_ordinal": "int16", "dst_feature": "int32", "edge_ie": "float32"}
+
+
+def read_edge_hive(edge_dir) -> pd.DataFrame:
+    """Read the edge hive with partition columns restored to their real dtypes.
+    See src.attribution.nodes.read_node_hive for why the Categorical matters."""
+    df = pd.read_parquet(Path(edge_dir) / "edges")
+    return df.astype({c: t for c, t in _EDGE_DTYPES.items() if c in df.columns})
+
 
 def _detach_site_hook(tensor, hook):
     """Stop-gradient at one site: a value-preserving identity in the forward
@@ -204,6 +214,11 @@ def edge_pass(model, saes, spec: EdgeSpec, clean_tokens,
 
     feature_ups = [u for u in up_feats if u != ERROR_IDX]
     up_has_error = include_error and ERROR_IDX in up_feats
+    # One tensor gather beats len(up_feats) scalar .item() calls per downstream
+    # node: with filter_mode="marks" the upstream side is unfiltered, so that
+    # loop ran into the thousands per backward.
+    up_index = (torch.tensor(feature_ups, device=df_i.device, dtype=torch.long)
+                if feature_ups else None)
     edges = []
     for d in down_feats:
         if d == ERROR_IDX:
@@ -216,12 +231,13 @@ def edge_pass(model, saes, spec: EdgeSpec, clean_tokens,
                                        allow_unused=True)
         # (dm/dd)*(dd/du) is in gfi/gri; contract with the upstream delta and
         # sum positions.
-        if feature_ups and gfi is not None:
-            up_vals = (gfi * df_i).sum(dim=0)  # [d_sae]
-            for u in feature_ups:
-                v = up_vals[u].item()
-                if v != 0.0:
-                    edges.append((u, d, v))
+        if up_index is not None and gfi is not None:
+            up_vals = (gfi * df_i).sum(dim=0)[up_index]      # [n_up]
+            nz = up_vals.nonzero(as_tuple=True)[0]
+            if nz.numel():
+                us = up_index[nz].tolist()
+                vs = up_vals[nz].tolist()
+                edges.extend((u, d, v) for u, v in zip(us, vs))
         if up_has_error and gri is not None:
             v = (gri * dres_i).sum().item()
             if v != 0.0:
