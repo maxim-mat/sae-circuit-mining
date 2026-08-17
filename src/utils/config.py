@@ -23,6 +23,11 @@ class DataConfig:
     max_length: Optional[int] = None
     text_column: Optional[str] = None  # mib only
     split: str = "train"               # mib only
+    # Which Example.meta key identifies an example's template. Recorded in the
+    # examples.parquet sidecar ALWAYS; whether it is used is selection's call
+    # (selection.block_col). "case" for Marks' SVA (the agreement configuration),
+    # "template" for MIB. None puts every example in one template.
+    template_field: Optional[str] = None
     # A run is scoped to ONE counterfactual: causal questions do not mix, and
     # this way the choice lands in the manifest and the cache key instead of
     # becoming a partition column. Required for loader="mib"; unused for "sva",

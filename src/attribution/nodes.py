@@ -53,6 +53,20 @@ TOTAL_EFFECT_SCHEMA = pa.schema([
     ("total_effect", pa.float32()),
 ])
 
+# prompt -> template map, one row per example. Written unconditionally so the
+# choice of whether to block on it stays a selection-time decision rather than
+# an attribution-time one -- re-deciding it must never cost an attribution run.
+#
+# `template_key` is the raw value from Example.meta[data.template_field];
+# `template_id` is a small int assigned in first-appearance order, stable within
+# a run. With template_field unset every example lands in template 0, which is
+# the honest description of Marks' SVA data: one syntactic frame throughout.
+EXAMPLE_SCHEMA = pa.schema([
+    ("example_idx", pa.int32()),
+    ("template_id", pa.int16()),
+    ("template_key", pa.string()),
+])
+
 _EMPTY_BATCH = {name: [] for name in NODE_SCHEMA.names}
 CHUNK_SIZE = 10          # examples between parquet flushes
 
@@ -116,6 +130,8 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
 
     batch = {name: list(_EMPTY_BATCH[name]) for name in NODE_SCHEMA.names}
     totals = {name: [] for name in TOTAL_EFFECT_SCHEMA.names}
+    examples_meta = {name: [] for name in EXAMPLE_SCHEMA.names}
+    template_ids: dict[str, int] = {}
     rows_written = 0
     skipped = 0
 
@@ -168,6 +184,13 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
             metric_patch = metric_fn(logits=patch_logits, example=example, model=model,
                                      tokens=patch_tokens)
         model.reset_hooks()
+
+        key = ("" if cfg.data.template_field is None
+               else str(example.meta.get(cfg.data.template_field, "")))
+        examples_meta["example_idx"].append(ex_idx)
+        examples_meta["template_id"].append(
+            template_ids.setdefault(key, len(template_ids)))
+        examples_meta["template_key"].append(key)
 
         totals["example_idx"].append(ex_idx)
         totals["metric_clean"].append(float(metric_clean))
@@ -250,6 +273,8 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
     rows_written += _flush(batch, out_dir)
     pq.write_table(pa.Table.from_pydict(totals, schema=TOTAL_EFFECT_SCHEMA),
                    out_dir / "total_effects.parquet", compression="zstd")
+    pq.write_table(pa.Table.from_pydict(examples_meta, schema=EXAMPLE_SCHEMA),
+                   out_dir / "examples.parquet", compression="zstd")
 
     n_examples = len(totals["example_idx"])
     mean_total_effect = (sum(totals["total_effect"]) / n_examples) if n_examples else 0.0
@@ -259,6 +284,7 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
         "row_count": rows_written,
         "n_examples": n_examples,
         "n_skipped": skipped,
+        "n_templates": len(template_ids),
         "mean_total_effect": mean_total_effect,
         "runtime_s": round(time.time() - started, 2),
     }
