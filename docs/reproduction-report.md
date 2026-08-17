@@ -1,10 +1,41 @@
 # Reproduction report — Marks et al. RC circuit
 
-**Status: NOT YET RUN.** The pipeline is implemented and its unit tests pass
-(77 tests, `pytest -m "not slow"`), but no attribution run has been executed:
-that needs model weights, the 19 SAE downloads and GPU time. This file is the
-template the run fills in; every "measured" cell is empty on purpose rather than
-estimated.
+**Status: smoke-tested, full run NOT YET DONE.** The pipeline runs end to end on
+a 5-example smoke configuration (see below), but the 100-example reproduction has
+not been executed. The results table below is still empty on purpose rather than
+filled with smoke-test numbers, which are not comparable to Marks'.
+
+## Smoke run — 2026-08-17, 5 examples
+
+```
+data.num_examples=5  attribution.ig_steps=2  evaluation.num_examples=5
+```
+
+| Stage | Result | Time |
+|---|---|---|
+| node_attribution | 96,574 rows, 5 examples, 0 skipped, mean total effect **+3.92** | 39 s |
+| selection | 83 of 35,161 nodes selected | 0.2 s |
+| edge_attribution | 397,869 edges over **31 specs** | 19 s |
+| circuit | **83 nodes, 371 edges** | 0.2 s |
+| evaluation | **faithfulness 0.179** (F_C −1.003, F_M −1.936, F_∅ −0.799) | 13 s |
+
+31 specs is the expected template size: 6 blocks x 5 edges
+(MR/AR/RM/RA/RR, AM suppressed by `parallel_attn`) + the final resid→y.
+
+A second identical invocation replayed all five stages from their manifests in
+under a second (`was_cached: True` throughout), so the caching contract holds
+end to end.
+
+**Do not read 0.179 as a reproduction of 0.21.** It is 5 examples with 2 IG
+steps against their 100 and 10, evaluated on 5 test examples against their 40.
+The agreement in magnitude is encouraging, not evidence.
+
+**Note on the metric's sign.** `sva_logit_diff` is `logit(patch) − logit(clean)`,
+which is *negative* when the model is behaving correctly on a clean input —
+hence F_M = −1.94 (the model prefers the clean answer by 1.94 logits) sitting
+*below* F_∅ = −0.80. Faithfulness is a ratio of two differences, so the global
+sign cancels and 0.179 is unaffected; see divergence 1 in
+`docs/reference-numbers.md`.
 
 **Targets** come from `docs/reference-numbers.md` (arXiv:2403.19647v3 §3.3 and
 Fig. 7).
