@@ -97,6 +97,10 @@ class EvalConfig:
     ablation: str = "mean"             # "mean" | "resample" | "zero"
     handle_errors: str = "default"     # "default" | "keep" | "remove"
     start_layer: int = -1
+    # Per-node leave-one-out necessity (Wang et al. arXiv:2211.00593 section 4.2,
+    # approximated with K={}). Costs one forward pass per circuit node, so it is
+    # opt-in. Marks do not measure this; it is for comparing selectors.
+    minimality: bool = False
 
 
 @dataclass

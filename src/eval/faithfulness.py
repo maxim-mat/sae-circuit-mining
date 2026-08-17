@@ -80,10 +80,18 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
                        ablation: str, handle_errors: str, device: str,
                        prepend_bos: bool = True, start_layer: int = -1,
                        invert: bool = False) -> float:
-    """Mean metric with every feature outside `keep_mask` ablated.
+    """Mean metric with everything outside `keep_mask` ablated.
 
-    keep_mask maps site_ordinal -> set of kept feature indices (ERROR_IDX for the
-    reconstruction-error term). Pass None to keep everything (that is F(M)).
+    keep_mask maps site_ordinal -> set of (token_idx, feature_idx) pairs, with
+    feature_idx = ERROR_IDX for the reconstruction-error term and token_idx = -1
+    meaning "every position" (which is what aggregation="sum" produces). Pass
+    None to keep everything -- that is F(M).
+
+    The mask is POSITION-RESOLVED. Keying it by feature alone would keep a
+    feature at all positions when the circuit selected it at one, scoring a
+    circuit larger than the one being reported: on rc_train n=100 that turned 84
+    selected nodes into 486 kept ones.
+
     handle_errors: "keep" never ablates the error term, "remove" always does,
     "default" lets the mask decide. Sites before start_layer are left untouched.
     """
@@ -108,25 +116,35 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
             err = tensor - recon
 
             ref = _ablation_values(feats, ablation)
+            seq = feats.shape[1]
             if keep_mask is None:
                 new_feats = feats
-                in_circuit_err = True
+                err_keep = torch.ones(seq, dtype=torch.bool, device=feats.device)
             else:
                 kept = keep_mask.get(site.ordinal, set())
-                mask = torch.zeros(feats.shape[-1], dtype=torch.bool, device=feats.device)
-                idx = [f for f in kept if f != ERROR_IDX]
-                if idx:
-                    mask[torch.tensor(idx, device=feats.device)] = True
-                in_circuit_err = ERROR_IDX in kept
-                if invert:                       # M \ C: ablate the circuit, keep the rest
+                # [seq, d_sae], broadcast against feats [batch, seq, d_sae].
+                mask = torch.zeros(seq, feats.shape[-1], dtype=torch.bool,
+                                   device=feats.device)
+                err_keep = torch.zeros(seq, dtype=torch.bool, device=feats.device)
+                for tok, feat in kept:
+                    if tok >= seq:
+                        continue          # guarded and reported by the caller
+                    rows = slice(None) if tok < 0 else tok
+                    if feat == ERROR_IDX:
+                        err_keep[rows] = True
+                    else:
+                        mask[rows, feat] = True
+                if invert:                 # M \ C: ablate the circuit, keep the rest
                     mask = ~mask
-                    in_circuit_err = not in_circuit_err
+                    err_keep = ~err_keep
                 new_feats = torch.where(mask, feats, ref)
 
-            keep_err = (handle_errors == "keep" or
-                        (handle_errors == "default" and
-                         (keep_mask is None or in_circuit_err)))
-            new_err = err if keep_err else _ablation_values(err, ablation)
+            if handle_errors == "keep":
+                err_keep = torch.ones_like(err_keep)
+            elif handle_errors == "remove":
+                err_keep = torch.zeros_like(err_keep)
+            new_err = torch.where(err_keep.unsqueeze(-1), err,
+                                  _ablation_values(err, ablation))
             return sae.decode(new_feats) + new_err
 
         return hook
@@ -142,6 +160,46 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
             for i, ex in enumerate(examples)
         ]
     return sum(scores) / len(scores)
+
+
+def build_keep_mask(nodes) -> dict[int, set[tuple[int, int]]]:
+    """Circuit node table -> {site_ordinal: {(token_idx, feature_idx)}}.
+
+    token_idx is carried through, not collapsed: under aggregation="none" the
+    node IS the (position, feature) pair. aggregation="sum" writes token_idx=-1,
+    which the mask reads as "all positions".
+    """
+    mask: dict[int, set[tuple[int, int]]] = {}
+    tokens = nodes["token_idx"] if "token_idx" in nodes else [-1] * len(nodes)
+    for ordinal, token, feature in zip(nodes["site_ordinal"], tokens,
+                                       nodes["feature_idx"]):
+        mask.setdefault(int(ordinal), set()).add((int(token), int(feature)))
+    return mask
+
+
+def minimality_scores(model, saes, suite, examples, keep_mask, metric_fn,
+                      f_c: float, **common) -> dict:
+    """Per-node leave-one-out: |F(C \\ {v}) - F(C)| for every v in C.
+
+    An approximation of Wang et al. 2023 (arXiv:2211.00593) section 4.2, which
+    asks for SOME subset K with |F(C\\(K u {v})) - F(C\\K)| large and needs an
+    exponential search. K = {} is the cheap lower bound: it understates the
+    necessity of any node with a redundant backup, since the backup covers for
+    it while the rest of the circuit is intact.
+
+    Costs one forward pass per node. Marks do not measure this -- their criteria
+    are interpretability, faithfulness and completeness (section 3.2) -- so it is
+    reported for the selector comparison, not for the reproduction.
+    """
+    scores = {}
+    for ordinal, nodes in keep_mask.items():
+        for node in nodes:
+            reduced = {o: set(v) for o, v in keep_mask.items()}
+            reduced[ordinal].discard(node)
+            f_without = run_with_ablations(model, saes, suite, examples, reduced,
+                                           metric_fn, **common)
+            scores[(ordinal, node[0], node[1])] = abs(f_without - f_c)
+    return scores
 
 
 def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
@@ -165,9 +223,7 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     if not examples:
         raise ValueError(f"No evaluation examples loaded from {data_path!r}")
 
-    keep_mask: dict[int, set[int]] = {}
-    for ordinal, feature in zip(circuit.nodes["site_ordinal"], circuit.nodes["feature_idx"]):
-        keep_mask.setdefault(int(ordinal), set()).add(int(feature))
+    keep_mask = build_keep_mask(circuit.nodes)
 
     common = dict(ablation=cfg.evaluation.ablation,
                   handle_errors=cfg.evaluation.handle_errors,
@@ -183,6 +239,23 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     f_complement = run_with_ablations(model, saes, suite, examples, keep_mask,
                                       metric_fn, invert=True, **common)
 
+    # Position indices only transfer if the eval split tokenises to the same
+    # length the circuit was discovered at; use_min_length_only makes that true
+    # within a split but not necessarily across train/test.
+    seq_len = model.to_tokens(examples[0].clean_prefix,
+                              prepend_bos=prepend_bos).shape[1]
+    stale = sum(1 for nodes in keep_mask.values() for tok, _ in nodes if tok >= seq_len)
+    if stale:
+        logger.warning("%d circuit nodes sit at token positions >= the eval "
+                       "sequence length (%d) and were dropped from the mask; the "
+                       "train and test splits do not share a token length.",
+                       stale, seq_len)
+
+    minimality = {}
+    if cfg.evaluation.minimality:
+        minimality = minimality_scores(model, saes, suite, examples, keep_mask,
+                                       metric_fn, f_c, **common)
+
     result = {
         "faithfulness": faithfulness(f_c, f_m, f_empty),
         "completeness": faithfulness(f_complement, f_m, f_empty),
@@ -190,9 +263,25 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
         "F_complement": f_complement,
         "n_nodes": len(circuit.nodes),
         "n_examples": len(examples),
+        "n_nodes_stale": stale,
         "start_layer": resolve_start_layer(suite, cfg.evaluation.start_layer),
         "runtime_s": round(time.time() - started, 2),
     }
+    if minimality:
+        vals = sorted(minimality.values())
+        # Wang et al. call a node's contribution nontrivial at >=1% of F(M).
+        floor = 0.01 * abs(f_m)
+        result.update({
+            "minimality_min": vals[0],
+            "minimality_median": vals[len(vals) // 2],
+            "minimality_mean": sum(vals) / len(vals),
+            "minimality_frac_nontrivial": sum(v >= floor for v in vals) / len(vals),
+        })
+        (Path(out_dir) / "minimality.json").write_text(json.dumps(
+            {f"{o}:{t}:{f}": v for (o, t, f), v in minimality.items()}, indent=2))
+        logger.info("Minimality: median %.4f, %.0f%% of nodes above the 1%% floor",
+                    result["minimality_median"],
+                    100 * result["minimality_frac_nontrivial"])
     (Path(out_dir) / "faithfulness.json").write_text(json.dumps(result, indent=2))
     logger.info("Faithfulness %.4f | completeness %.4f (ideal 0) "
                 "[F_C=%.4f F_M\\C=%.4f F_M=%.4f F_empty=%.4f]",

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,8 +111,14 @@ def resolve_stage_output(cfg, stage: str, compute_fn):
     Returns (output_dir, was_cached).
 
     The manifest is stamped only after compute_fn returns, so an interrupted run
-    leaves an unmanifested directory that will never be served as a hit. On
-    cfg.run.force the directory is reused in place and recomputed.
+    leaves an unmanifested directory that will never be served as a hit.
+
+    Any pre-existing directory is CLEARED before computing. Hive writers append
+    (pq.write_to_dataset adds files rather than replacing them), so recomputing
+    into a populated directory duplicates every row -- and since the manifest is
+    rewritten afterwards with the new run's counts, the result looks correct and
+    is not. That is reachable both via run.force and by resuming after a crash
+    that left a half-written hive.
     """
     params = stage_params(cfg, stage)
     root = cfg.run.output_root
@@ -123,7 +130,10 @@ def resolve_stage_output(cfg, stage: str, compute_fn):
             return hit, True
 
     out_dir = stage_dir(root, stage, params)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists():
+        logger.info("[%s] clearing %s before recompute", stage, out_dir)
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
     logger.info("[%s] computing into %s", stage, out_dir)
     extra = compute_fn(out_dir) or {}
     write_manifest(out_dir, stage, params, extra)

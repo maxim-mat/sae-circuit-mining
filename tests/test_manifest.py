@@ -46,7 +46,7 @@ def test_incomplete_dir_is_not_a_hit(tmp_path):
 # -- the redundancy mechanism itself --------------------------------------
 
 from src.utils.config import Config
-from src.utils.manifest import resolve_stage_output
+from src.utils.manifest import resolve_stage_output, stage_params
 
 
 def _cfg(tmp_path, **over):
@@ -133,3 +133,43 @@ def test_manifest_records_what_produced_the_hive(tmp_path):
     assert m["params"]["data"]["counterfactual"] is None
     assert m["row_count"] == 42
     assert m["git_commit"] and m["created_utc"]
+
+
+def test_force_replaces_outputs_rather_than_appending(tmp_path):
+    """Regression: hive writers append, so recomputing into a populated
+    directory duplicates every row -- and the manifest is then rewritten with
+    the new run's counts, so the corruption is invisible. A real n=100 node hive
+    reached 5,790,378 rows against a manifest claiming 1,345,653 this way."""
+    def compute(out_dir):
+        # Mimic pq.write_to_dataset: add a new file each call, never replace.
+        existing = list(out_dir.glob("part-*.parquet"))
+        (out_dir / f"part-{len(existing)}.parquet").write_bytes(b"x")
+        return {"row_count": 10}
+
+    cfg = _cfg(tmp_path)
+    d1, _ = resolve_stage_output(cfg, "node_attribution", compute)
+    assert len(list(d1.glob("part-*.parquet"))) == 1
+
+    cfg.run.force = True
+    d2, cached = resolve_stage_output(cfg, "node_attribution", compute)
+    assert cached is False
+    assert len(list(d2.glob("part-*.parquet"))) == 1, \
+        "a forced recompute must replace the hive, not stack a second copy on it"
+
+
+def test_a_crashed_half_written_hive_is_cleared_not_appended_to(tmp_path):
+    """The same trap without force: an interrupted run leaves an unmanifested
+    directory, and the retry must not add its rows to the wreckage."""
+    params = stage_params(_cfg(tmp_path), "node_attribution")
+    d = stage_dir(str(tmp_path), "node_attribution", params)
+    d.mkdir(parents=True)
+    (d / "part-0.parquet").write_bytes(b"partial")   # crashed mid-write
+
+    def compute(out_dir):
+        (out_dir / "part-0.parquet").write_bytes(b"clean")
+        return {}
+
+    out, cached = resolve_stage_output(_cfg(tmp_path), "node_attribution", compute)
+    assert cached is False
+    assert (out / "part-0.parquet").read_bytes() == b"clean"
+    assert len(list(out.glob("part-*.parquet"))) == 1
