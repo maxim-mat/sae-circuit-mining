@@ -124,6 +124,12 @@ def main():
                     help="Blocks that also pay for per-node leave-one-out.")
     ap.add_argument("--minimality-max-n", type=int, default=1000,
                     help="Never run minimality above this n, whatever --minimality-for says.")
+    # run_with_ablations batches the WHOLE eval set into one forward, so each SAE
+    # hook holds several [eval_n, seq, d_sae] tensors at once -- 3.1GB apiece at
+    # eval_n=4000, times four live tensors, against 24GB of VRAM. Cap it: 1000
+    # eval examples is already 25x what Marks use.
+    ap.add_argument("--max-eval-n", type=int, default=1000,
+                    help="Upper bound on evaluation.num_examples regardless of n.")
     ap.add_argument("--limit", type=int, default=None,
                     help="Run only the first N cells (smoke-testing the sweep).")
     ap.add_argument("--wandb", action="store_true", help="Log each cell to wandb.")
@@ -171,7 +177,8 @@ def main():
     for n, block, name, over in plan:
         overrides = [
             f"data.num_examples={n}",
-            f"evaluation.num_examples={max(1, int(n * TEST_FRACTION))}",
+            f"evaluation.num_examples="
+            f"{min(args.max_eval_n, max(1, int(n * TEST_FRACTION)))}",
             "edges.enabled=false",
             f"run.output_root={args.output_root}",
             f"evaluation.minimality="

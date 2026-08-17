@@ -25,6 +25,11 @@ mkdir -p "$LOGDIR"
 MIN_BLOCKS="curves errors ha_grid"
 MIN_MAX_N=1000
 
+# Evaluation batches its whole example set into one forward, so eval size is
+# bounded by VRAM rather than by statistics. 0.4*n would ask for 4000 at
+# n=10000, which does not fit 24GB; 1000 is still 25x Marks' 40.
+MAX_EVAL_N="${MAX_EVAL_N:-1000}"
+
 run_stage () {
   local name="$1"; shift
   local log="${LOGDIR}/${name}.log"
@@ -48,7 +53,7 @@ echo "Plan written to ${LOGDIR}/plan.txt" | tee -a "${LOGDIR}/summary.log"
 # ---- Stage 1: the curves at n=100, plus the error variants. ~45 min ---------
 run_stage "stage1-curves-n100" \
   --n 100 --blocks curves errors --wandb \
-  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \
+  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \n  --max-eval-n $MAX_EVAL_N \
   --output-root "$OUT_ROOT"
 
 # ---- Stage 2: the calibrated arm's own knobs, tuned at n=100. ~4-12 h -------
@@ -56,19 +61,19 @@ run_stage "stage1-curves-n100" \
 # the wall time matters more than per-node necessity for the grid.
 run_stage "stage2-ha_grid-n100" \
   --n 100 --blocks ha_grid --ha-grid-n 100 --wandb \
-  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \
+  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \n  --max-eval-n $MAX_EVAL_N \
   --output-root "$OUT_ROOT"
 
 # ---- Stage 3: scale the curves to n=1000. ~2.5 h ---------------------------
 run_stage "stage3-curves-n1000" \
   --n 1000 --blocks curves errors --wandb \
-  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \
+  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \n  --max-eval-n $MAX_EVAL_N \
   --output-root "$OUT_ROOT"
 
 # ---- Stage 4: n=10000, no minimality (see MIN_MAX_N). ~19 h ----------------
 run_stage "stage4-curves-n10000" \
   --n 10000 --blocks curves errors --wandb \
-  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \
+  --minimality-for $MIN_BLOCKS --minimality-max-n $MIN_MAX_N \n  --max-eval-n $MAX_EVAL_N \
   --output-root "$OUT_ROOT"
 
 echo "=== [$(date +%H:%M:%S)] ALL STAGES DONE" | tee -a "${LOGDIR}/summary.log"
