@@ -22,16 +22,15 @@ Pipeline (per counterfactual type):
   select_features / build_event_log
                                  final activity alphabet + filtered events
 
-Input: the hive-partitioned parquet dataset written by main.py, partitioned
-by counterfactual and layer, with columns prompt_idx, token_idx, token_id,
-feature_idx, attribution(float16). Use load_counterfactual() to read one CF;
-the CLI (see bottom) runs the whole pipeline per CF and writes the feature
-table and event log back in the SAME hive layout, partitioned by
-counterfactual: {out_dir}/features|eventlog/counterfactual=<cf>/*.parquet.
-Part 2 (partial_order.py) and edge_attribution.py --nodes read those dirs.
+Input: the raw node-attribution hive written by src/attribution/nodes.py --
+long-format rows of (example_idx, site_ordinal, block, kind, token_idx,
+token_id, feature_idx, attribution), one run per counterfactual (spec D4).
+Selection consumes the RAW per-(example, position, feature) rows rather than the
+aggregate, because the null model is fitted on the per-row null tail. Entry
+point: select_calibrated(nodes_raw, cfg), dispatched from src/selection.
 Optional columns if regenerated: is_error (bool) for SAE error nodes; a block
-column (e.g. template_id) for correlated-prompt blocking — NOT present in the
-current data, so recurrence trials default to individual prompts until it is
+column (e.g. template_id) for correlated-example blocking -- NOT present in the
+current data, so recurrence trials default to individual examples until it is
 added at generation time.
 
 Statistical roles, stated once:
@@ -51,83 +50,14 @@ Statistical roles, stated once:
 
 from __future__ import annotations
 
-import argparse
-import os
-
 import numpy as np
 import pandas as pd
 
-GROUP_COLS = ["prompt_idx", "layer"]
-FEATURE_COLS = ["layer", "feature_idx"]
+GROUP_COLS = ["example_idx", "site_ordinal"]
+FEATURE_COLS = ["site_ordinal", "feature_idx"]
 
 FP16_SUBNORMAL_MAX = 6.1e-5   # below this, stored fp16 loses relative precision
 FP16_MIN_POSITIVE = 6.0e-8    # below this, stored fp16 underflows to zero
-
-
-# ===========================================================================
-# Data loading — partitioned parquet dataset produced by main.py
-# ===========================================================================
-#
-# On-disk layout (hive-partitioned by counterfactual and layer):
-#   {attributions_dir}/counterfactual=<cf>/layer=<L>/*.parquet
-# File columns: prompt_idx(int32), token_idx(int16), token_id(int32),
-#               feature_idx(int32), attribution(float16)
-# Partition columns recovered on read: counterfactual(str), layer(int)
-#
-# The pipeline runs PER counterfactual (one event log / net per CF type), so
-# load one counterfactual at a time. Zero-attribution rows (gradient 0 or
-# Delta-f 0, plus fp16 underflow) are dropped by default: they carry no
-# causal signal and inflate memory ~an order of magnitude, but the fraction
-# dropped is reported so it can be inspected.
-
-def list_counterfactuals(attributions_dir: str) -> list[str]:
-    """Enumerate available counterfactual partitions on disk."""
-    return sorted(
-        d.split("=", 1)[1]
-        for d in os.listdir(attributions_dir)
-        if d.startswith("counterfactual=")
-    )
-
-
-def load_counterfactual(
-    attributions_dir: str,
-    counterfactual: str,
-    layers: list[int] | None = None,
-    drop_zeros: bool = True,
-    columns: list[str] | None = None,
-) -> pd.DataFrame:
-    """Load one counterfactual partition into a long-format dataframe.
-
-    Uses pyarrow dataset filtering so only the requested counterfactual
-    (and optionally a subset of layers) is read from disk. Recovers the
-    partition columns, casts fp16 attributions to float64, and — unless
-    disabled — drops exact-zero attributions.
-    """
-    import pyarrow.dataset as ds
-
-    dataset = ds.dataset(attributions_dir, format="parquet", partitioning="hive")
-    flt = ds.field("counterfactual") == counterfactual
-    if layers is not None:
-        flt = flt & ds.field("layer").isin(layers)
-
-    want = columns or ["prompt_idx", "token_idx", "token_id",
-                       "feature_idx", "attribution", "layer", "counterfactual"]
-    have = set(dataset.schema.names)
-    want = [c for c in want if c in have]
-
-    table = dataset.to_table(filter=flt, columns=want)
-    df = table.to_pandas()
-
-    df["attribution"] = df["attribution"].astype(np.float64)
-    for c in ("prompt_idx", "token_idx", "token_id", "feature_idx", "layer"):
-        if c in df:
-            df[c] = df[c].astype(np.int64)
-
-    if drop_zeros:
-        n0 = len(df)
-        df = df[df["attribution"] != 0.0].reset_index(drop=True)
-        df.attrs["zero_frac_dropped"] = (n0 - len(df)) / max(n0, 1)
-    return df
 
 
 # ===========================================================================
@@ -170,7 +100,7 @@ def mad_screen(
     group_cols: list[str] = GROUP_COLS,
     q: float = 1.0,
     n0: float = 50.0,
-    pool_col: str = "layer",
+    pool_col: str = "site_ordinal",
     exclude_subnormals_from_fit: bool = True,
 ) -> pd.DataFrame:
     """Permissive denoising screen with per-group calibration.
@@ -279,7 +209,7 @@ def recurrence_test(
     df: pd.DataFrame,
     kept_col: str = "kept_screen",
     feature_cols: list[str] = FEATURE_COLS,
-    case_col: str = "prompt_idx",
+    case_col: str = "example_idx",
     block_col: str | None = None,
     q: float = 1.0,
     fdr: float = 0.05,
@@ -402,10 +332,10 @@ def build_event_log(
     """
     alphabet = feats.loc[feats["selected"], feature_cols]
     events = df[df["kept_screen"]].merge(alphabet, on=feature_cols, how="inner")
-    keep = [c for c in ["prompt_idx", "layer", "token_idx", "token_id",
+    keep = [c for c in ["example_idx", "site_ordinal", "token_idx", "token_id",
                         "feature_idx", "attribution", "abs_attr", "sign"]
             if c in events.columns]
-    return events[keep].sort_values(["prompt_idx", "layer", "token_idx"])
+    return events[keep].sort_values(["example_idx", "site_ordinal", "token_idx"])
 
 
 def negative_control(df: pd.DataFrame, seed: int = 0, **kwargs) -> pd.Series:
@@ -445,120 +375,23 @@ def negative_control(df: pd.DataFrame, seed: int = 0, **kwargs) -> pd.Series:
 
 
 # ===========================================================================
-# CLI — run the pipeline on the real partitioned attribution dataset
+# Stage entry point
 # ===========================================================================
 
-def _write_hive(df: pd.DataFrame, root: str, counterfactual: str) -> str:
-    """Write one CF as {root}/counterfactual=<cf>/*.parquet.
+def select_calibrated(nodes_raw: pd.DataFrame, cfg) -> pd.DataFrame:
+    """Hypothesis-testing selection. Consumes the RAW per-(example, position,
+    feature) rows, not the aggregate -- its null model is built from the
+    per-row null tail.
 
-    Same hive layout main.py writes for the raw attributions, so downstream
-    readers that open a directory as one pyarrow dataset (edge_attribution's
-    --nodes, event_log.load_attributions) see the counterfactual as a column
-    and can read every CF at once. delete_matching keeps a re-run from
-    appending duplicate rows to the CF's partition.
+    Returns the feature table with the same `selected` contract as
+    src.selection.threshold.select_by_threshold, so run_selection can dispatch
+    on cfg.selection.method without either side knowing about the other.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    pq.write_to_dataset(
-        pa.Table.from_pandas(df.assign(counterfactual=str(counterfactual)),
-                             preserve_index=False),
-        root_path=root,
-        partition_cols=["counterfactual"],
-        existing_data_behavior="delete_matching",
-        compression="zstd",
+    _, feats, summary = select_features(
+        nodes_raw,
+        q=cfg.selection.fdr_q,
+        block_col=cfg.selection.block_col,
+        min_recurrence_frac=cfg.selection.min_recurrence,
     )
-    return os.path.join(root, f"counterfactual={counterfactual}")
-
-
-def run_counterfactual(
-    attributions_dir: str,
-    counterfactual: str,
-    out_dir: str,
-    q: float = 1.0,
-    block_col: str | None = None,
-    min_recurrence_frac: float = 0.10,
-    min_sign_consistency: float | None = 0.8,
-    run_control: bool = True,
-) -> pd.Series:
-    """Load one CF, run selection, write feature table + event log as hive
-    partitions ({out_dir}/features|eventlog/counterfactual=<cf>/), and
-    (optionally) the null-simulation control. Returns the summary."""
-    print(f"[{counterfactual}] loading ...")
-    df = load_counterfactual(attributions_dir, counterfactual, drop_zeros=True)
-    print(f"[{counterfactual}] {len(df):,} nonzero rows "
-          f"(dropped {df.attrs.get('zero_frac_dropped', 0):.1%} zeros)")
-
-    df = add_abs_and_sign(df)
-    print("=== data quality ===")
-    print(data_quality_report(df).to_string())
-
-    dfs, feats, summary = select_features(
-        df, q=q, block_col=block_col,
-        min_recurrence_frac=min_recurrence_frac,
-        min_sign_consistency=min_sign_consistency,
-    )
-    print("\n=== gaussianity (median over groups) ===")
-    gr = gaussianity_report(df)
-    print(gr[["ppcc", "qq_rmse", "tail2", "tail3"]].median().to_string())
-
-    print("\n=== selection summary ===")
-    print(summary.to_string())
-
-    if run_control:
-        print("\n=== negative control (null simulation; expect ~0 selected) ===")
-        ctrl = negative_control(
-            df, q=q, block_col=block_col,
-            min_recurrence_frac=min_recurrence_frac,
-            min_sign_consistency=min_sign_consistency,
-        )
-        print(f"selected under null: {int(ctrl['selected'])}")
-
-    os.makedirs(out_dir, exist_ok=True)
-    log = build_event_log(dfs, feats)
-    feats_path = _write_hive(feats, os.path.join(out_dir, "features"), counterfactual)
-    log_path = _write_hive(log, os.path.join(out_dir, "eventlog"), counterfactual)
-    print(f"\nwrote {feats_path}\nwrote {log_path}")
-    print(f"event log: {len(log):,} events | "
-          f"{log.groupby(FEATURE_COLS).ngroups} activities")
-    return summary
-
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="Calibrated SAE feature selection on the partitioned "
-                    "attribution dataset (one event log per counterfactual).")
-    ap.add_argument("--attributions_dir", default="sae_attributions",
-                    help="Root of the hive-partitioned parquet dataset.")
-    ap.add_argument("--out_dir", default="event_logs",
-                    help="Root for the hive-partitioned outputs: "
-                         "{out_dir}/features|eventlog/counterfactual=<cf>/.")
-    ap.add_argument("--counterfactual", default=None,
-                    help="CF partition to process; default = all found.")
-    ap.add_argument("--q", type=float, default=1.0,
-                    help="Expected false positives per group (Stage-1 c).")
-    ap.add_argument("--block_col", default=None,
-                    help="Correlated-trial block column (e.g. template_id); "
-                         "absent from current data — add at generation time.")
-    ap.add_argument("--min_recurrence_frac", type=float, default=0.10)
-    ap.add_argument("--min_sign_consistency", type=float, default=0.8)
-    ap.add_argument("--no_control", action="store_true",
-                    help="Skip the null-simulation negative control.")
-    args = ap.parse_args()
-
-    cfs = ([args.counterfactual] if args.counterfactual
-           else list_counterfactuals(args.attributions_dir))
-    print(f"counterfactuals to process: {cfs}")
-
-    for cf in cfs:
-        run_counterfactual(
-            args.attributions_dir, cf, args.out_dir,
-            q=args.q, block_col=args.block_col,
-            min_recurrence_frac=args.min_recurrence_frac,
-            min_sign_consistency=args.min_sign_consistency,
-            run_control=not args.no_control,
-        )
-
-
-if __name__ == "__main__":
-    main()
+    feats.attrs["summary"] = summary
+    return feats
