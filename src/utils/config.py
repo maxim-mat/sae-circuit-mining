@@ -59,7 +59,17 @@ class SelectionConfig:
     #               test across examples.
     fdr_q: float = 0.05
     screen_q: float = 1.0
+    # Shrinkage weight for the Stage-1 scale estimate: the per-group MAD is
+    # pulled toward the per-site pooled MAD as
+    #     MAD_shrunk = (n_g * MAD_g + screen_n0 * MAD_pool) / (n_g + screen_n0)
+    # so screen_n0 is a pseudo-count -- the pool is worth this many observations.
+    # A group needs ~screen_n0 active features before its own scale outweighs
+    # the pool's. Raise it to trust the pool more (stabler, less adaptive).
+    screen_n0: float = 50.0
     min_recurrence: float = 0.1
+    # A genuine causal contributor should push the metric the same way each
+    # time; under the null the score is sign-symmetric. None disables the check.
+    min_sign_consistency: Optional[float] = 0.8
     block_col: Optional[str] = None
 
 

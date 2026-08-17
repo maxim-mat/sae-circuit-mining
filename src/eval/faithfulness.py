@@ -78,7 +78,8 @@ def resolve_start_layer(suite, start_layer: int) -> int:
 
 def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
                        ablation: str, handle_errors: str, device: str,
-                       prepend_bos: bool = True, start_layer: int = -1) -> float:
+                       prepend_bos: bool = True, start_layer: int = -1,
+                       invert: bool = False) -> float:
     """Mean metric with every feature outside `keep_mask` ablated.
 
     keep_mask maps site_ordinal -> set of kept feature indices (ERROR_IDX for the
@@ -109,17 +110,22 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
             ref = _ablation_values(feats, ablation)
             if keep_mask is None:
                 new_feats = feats
+                in_circuit_err = True
             else:
                 kept = keep_mask.get(site.ordinal, set())
                 mask = torch.zeros(feats.shape[-1], dtype=torch.bool, device=feats.device)
                 idx = [f for f in kept if f != ERROR_IDX]
                 if idx:
                     mask[torch.tensor(idx, device=feats.device)] = True
+                in_circuit_err = ERROR_IDX in kept
+                if invert:                       # M \ C: ablate the circuit, keep the rest
+                    mask = ~mask
+                    in_circuit_err = not in_circuit_err
                 new_feats = torch.where(mask, feats, ref)
 
             keep_err = (handle_errors == "keep" or
                         (handle_errors == "default" and
-                         (keep_mask is None or ERROR_IDX in keep_mask.get(site.ordinal, set()))))
+                         (keep_mask is None or in_circuit_err)))
             new_err = err if keep_err else _ablation_values(err, ablation)
             return sae.decode(new_feats) + new_err
 
@@ -170,16 +176,26 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     f_m = run_with_ablations(model, saes, suite, examples, None, metric_fn, **common)
     f_c = run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn, **common)
     f_empty = run_with_ablations(model, saes, suite, examples, {}, metric_fn, **common)
+    # Completeness (Marks section 3.2): the faithfulness of the circuit's COMPLEMENT.
+    # Ideal is 0 -- if ablating just the circuit destroys the behaviour, the
+    # circuit captured everything that mattered. High completeness means the
+    # model routes around the circuit, i.e. the circuit is missing something.
+    f_complement = run_with_ablations(model, saes, suite, examples, keep_mask,
+                                      metric_fn, invert=True, **common)
 
     result = {
         "faithfulness": faithfulness(f_c, f_m, f_empty),
+        "completeness": faithfulness(f_complement, f_m, f_empty),
         "F_C": f_c, "F_M": f_m, "F_empty": f_empty,
+        "F_complement": f_complement,
         "n_nodes": len(circuit.nodes),
         "n_examples": len(examples),
         "start_layer": resolve_start_layer(suite, cfg.evaluation.start_layer),
         "runtime_s": round(time.time() - started, 2),
     }
     (Path(out_dir) / "faithfulness.json").write_text(json.dumps(result, indent=2))
-    logger.info("Faithfulness %.4f (F_C=%.4f F_M=%.4f F_empty=%.4f)",
-                result["faithfulness"], f_c, f_m, f_empty)
+    logger.info("Faithfulness %.4f | completeness %.4f (ideal 0) "
+                "[F_C=%.4f F_M\\C=%.4f F_M=%.4f F_empty=%.4f]",
+                result["faithfulness"], result["completeness"],
+                f_c, f_complement, f_m, f_empty)
     return result

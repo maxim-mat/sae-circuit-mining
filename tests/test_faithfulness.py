@@ -32,3 +32,11 @@ def test_default_start_layer_skips_the_first_third():
 
 def test_explicit_start_layer_is_used_verbatim():
     assert resolve_start_layer(build_suite("pythia-marks"), 0) == 0
+
+
+def test_completeness_is_the_complement_s_faithfulness():
+    """Marks section 3.2: completeness = faithfulness of M \ C, ideal 0. It uses
+    the same formula, so a circuit whose complement recovers the full model
+    scores 1 (nothing captured) and one whose complement is dead scores 0."""
+    assert faithfulness(f_c=1.0, f_m=1.0, f_empty=0.0) == pytest.approx(1.0)
+    assert faithfulness(f_c=0.0, f_m=1.0, f_empty=0.0) == pytest.approx(0.0)

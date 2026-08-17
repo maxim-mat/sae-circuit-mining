@@ -16,13 +16,16 @@ def _cfg():
     cfg.selection.screen_q = 0.7      # Stage 1: false positives per group
     cfg.selection.fdr_q = 0.02        # Stage 2: BH level
     cfg.selection.min_recurrence = 0.3
+    cfg.selection.screen_n0 = 12.0
+    cfg.selection.min_sign_consistency = 0.6
     return cfg
 
 
 def test_screen_q_and_fdr_q_reach_different_parameters(monkeypatch):
     seen = {}
 
-    def fake_select_features(df, q=1.0, block_col=None, **kw):
+    def fake_select_features(df, q=1.0, block_col=None, n0=50.0, **kw):
+        kw["n0"] = n0
         seen.update({"q": q, "block_col": block_col, **kw})
         feats = pd.DataFrame({"site_ordinal": [], "feature_idx": [], "selected": []})
         return df, feats, pd.Series(dtype=float)
@@ -33,6 +36,8 @@ def test_screen_q_and_fdr_q_reach_different_parameters(monkeypatch):
     assert seen["q"] == 0.7, "Stage-1 screen rate must come from selection.screen_q"
     assert seen["fdr"] == 0.02, "Stage-2 BH level must come from selection.fdr_q"
     assert seen["min_recurrence_frac"] == 0.3
+    assert seen["n0"] == 12.0, "the MAD shrinkage pseudo-count must be searchable"
+    assert seen["min_sign_consistency"] == 0.6
 
 
 def test_the_two_rates_are_not_the_same_field():
