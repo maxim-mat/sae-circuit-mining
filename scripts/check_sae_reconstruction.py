@@ -10,8 +10,9 @@ Usage:
     python -m scripts.check_sae_reconstruction --suite pythia-marks
     python -m scripts.check_sae_reconstruction --suite gpt2-res --n-seqs 50
 
-Acceptance: variance explained >= 0.80 at every site, L0 in the tens to low
-hundreds. Writes a markdown table to docs/reference-numbers.md.
+Acceptance: variance explained >= --ve-floor at every site (default 0.80, taken
+from Marks' weakest published Pythia site), and L0 close to that site's own row
+in their tables. Writes a markdown table to docs/sae-reconstruction.md.
 """
 from __future__ import annotations
 
@@ -51,6 +52,12 @@ def parse_args():
     # and is not what published SAE evaluations report.
     p.add_argument("--keep-bos", action="store_true",
                    help="Score the BOS position too (default: skip it).")
+    # The default floor comes from Marks' Pythia tables (their weakest site,
+    # Attn 4, is 83%). It is NOT a universal standard: gpt2-small-res-jb scores
+    # ~0.78 at its late resid sites by construction, so pass --ve-floor when
+    # checking a suite Marks never published.
+    p.add_argument("--ve-floor", type=float, default=VE_FLOOR,
+                   help=f"Acceptance floor for variance explained (default {VE_FLOOR}).")
     return p.parse_args()
 
 
@@ -115,7 +122,7 @@ def main():
         ve = 1.0 - s["sq_err"] / total_var if total_var else float("nan")
         l0 = s["l0"] / n if n else float("nan")
         rows.append((site, ve, l0))
-        if not (ve >= VE_FLOOR):
+        if not (ve >= args.ve_floor):
             failures.append((site.sae_id, ve))
 
     lines = [
@@ -125,7 +132,7 @@ def main():
         "",
         f"{args.n_seqs} sequences x {args.seq_len} tokens from `{args.dataset}`, "
         f"seed {args.seed}, BOS position {'included' if args.keep_bos else 'skipped'}. "
-        f"Acceptance: variance explained >= {VE_FLOOR:.2f}.",
+        f"Acceptance: variance explained >= {args.ve_floor:.2f}.",
         "",
         "| ordinal | kind | block | sae_id | variance explained | mean L0 |",
         "|---|---|---|---|---|---|",

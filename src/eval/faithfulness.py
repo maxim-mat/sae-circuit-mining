@@ -25,7 +25,7 @@ import torch
 from src.circuit.build import load_circuit
 from src.data.loaders import load_sva_examples
 from src.metrics import get_metric
-from src.models.suites import build_suite, load_model_and_saes
+from src.models.suites import build_suite, load_model_and_saes, prepend_bos_for
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     suite = build_suite(cfg.suite.name)
     model, saes = load_model_and_saes(suite, cfg.suite.device, cfg.suite.dtype)
     metric_fn = get_metric(cfg.attribution.metric)
-    prepend_bos = getattr(next(iter(saes.values())).cfg, "prepend_bos", True)
+    prepend_bos = prepend_bos_for(saes)
 
     data_path = cfg.evaluation.data_path or cfg.data.path
     examples = load_sva_examples(

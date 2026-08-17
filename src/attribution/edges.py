@@ -47,7 +47,7 @@ import torch
 from src.attribution.edge_template import Y_SITE, EdgeSpec, build_template
 from src.data.loaders import load_examples
 from src.metrics import get_metric
-from src.models.suites import build_suite, load_model_and_saes
+from src.models.suites import build_suite, load_model_and_saes, prepend_bos_for
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +269,7 @@ def run_edge_attribution(cfg, selection_dir: Path, out_dir: Path) -> dict:
     model, saes = load_model_and_saes(suite, cfg.suite.device, cfg.suite.dtype)
     metric_fn = get_metric(cfg.attribution.metric)
     examples = load_examples(cfg.data, model, cfg.seed)
-    prepend_bos = getattr(next(iter(saes.values())).cfg, "prepend_bos", True)
+    prepend_bos = prepend_bos_for(saes)
 
     batch = {name: [] for name in EDGE_SCHEMA.names}
     total = 0

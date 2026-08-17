@@ -61,3 +61,52 @@ def test_hooks_are_transformerlens_names():
 def test_unknown_suite_raises():
     with pytest.raises(KeyError):
         build_suite("no-such-suite")
+
+
+# -- how the model must be reconstituted for its SAEs ---------------------
+
+from src.models.suites import model_load_kwargs, prepend_bos_for
+
+
+class _FakeSAE:
+    """Mimics the sae_lens 6.x shape: provenance lives on cfg.metadata."""
+    def __init__(self, **metadata):
+        class Meta:
+            pass
+        meta = Meta()
+        for k, v in metadata.items():
+            setattr(meta, k, v)
+
+        class Cfg:
+            pass
+        self.cfg = Cfg()
+        self.cfg.metadata = meta
+
+
+def test_prepend_bos_is_read_from_metadata_not_cfg():
+    """Regression: getattr(sae.cfg, "prepend_bos", True) always fell through to
+    its default under sae_lens 6.x, so the pythia SAEs -- which declare False --
+    were fed a BOS token they were never trained on."""
+    assert prepend_bos_for({"a": _FakeSAE(prepend_bos=False)}) is False
+    assert prepend_bos_for({"a": _FakeSAE(prepend_bos=True)}) is True
+
+
+def test_prepend_bos_defaults_to_true_when_unstated():
+    assert prepend_bos_for({"a": _FakeSAE()}) is True
+
+
+def test_model_kwargs_carry_the_release_s_weight_processing():
+    """gpt2-small-res-jb needs center_writing_weights; the pythia suite needs
+    nothing. Loading either the other way is measurably wrong -- see
+    docs/reference-numbers.md."""
+    gpt2 = _FakeSAE(model_from_pretrained_kwargs={"center_writing_weights": True})
+    assert model_load_kwargs({"a": gpt2}) == {"center_writing_weights": True}
+    assert model_load_kwargs({"a": _FakeSAE(model_from_pretrained_kwargs=None)}) == {}
+    assert model_load_kwargs({"a": _FakeSAE()}) == {}
+
+
+def test_model_kwargs_are_a_copy_not_the_saes_dict():
+    """Mutating the returned kwargs must not edit the SAE's own metadata."""
+    sae = _FakeSAE(model_from_pretrained_kwargs={"center_writing_weights": True})
+    model_load_kwargs({"a": sae})["center_writing_weights"] = False
+    assert sae.cfg.metadata.model_from_pretrained_kwargs == {"center_writing_weights": True}

@@ -98,16 +98,54 @@ def build_suite(name: str) -> Suite:
     return SUITES[name]
 
 
+def _sae_metadata(sae):
+    """sae_lens 6.x keeps provenance on cfg.metadata, not on cfg itself."""
+    return getattr(getattr(sae, "cfg", None), "metadata", None)
+
+
+def prepend_bos_for(saes) -> bool:
+    """The BOS convention the SAEs were trained under.
+
+    Read from cfg.metadata rather than cfg: a `getattr(sae.cfg, "prepend_bos",
+    True)` silently returns its default under sae_lens 6.x, which had us feeding
+    the pythia-marks SAEs a BOS token they declare they do not want
+    (`prepend_bos = False`, matching Marks' bare-HF-tokenizer loader).
+    """
+    md = _sae_metadata(next(iter(saes.values())))
+    value = getattr(md, "prepend_bos", None) if md is not None else None
+    return True if value is None else bool(value)
+
+
+def model_load_kwargs(saes) -> dict:
+    """Weight-processing kwargs the SAEs were trained against.
+
+    An SAE is trained on one specific version of a model's activations, so the
+    model must be reconstituted the same way. TransformerLens' default
+    processing is NOT neutral here: `center_writing_weights` removes the
+    mean-over-d_model component of everything written to the residual stream,
+    which the model cannot see (LayerNorm removes it anyway) but the SAE very
+    much can. Loading pythia-70m with full processing costs
+    blocks.3.hook_resid_post 15 points of variance explained (0.94 -> 0.79);
+    loading gpt2-small WITHOUT it is catastrophic (VE -241 at resid_post_11).
+
+    sae_lens records the right answer per release, so take it from there rather
+    than hardcoding a per-suite flag that can drift from the catalog.
+    """
+    md = _sae_metadata(next(iter(saes.values())))
+    kwargs = getattr(md, "model_from_pretrained_kwargs", None) if md is not None else None
+    return dict(kwargs or {})
+
+
 def load_model_and_saes(suite: Suite, device: str, dtype: str = "float32"):
-    """Load the model and every SAE in the suite. Returns (model, {sae_id: SAE})."""
+    """Load every SAE in the suite, then the model they were trained against.
+
+    Returns (model, {sae_id: SAE}). SAEs come first because their metadata is
+    what determines how the model must be loaded.
+    """
     from sae_lens import SAE
     from transformer_lens import HookedTransformer
 
     torch_dtype = _DTYPES[dtype]
-    logger.info("Loading model %s on %s", suite.model_name, device)
-    model = HookedTransformer.from_pretrained(
-        suite.model_name, device=device, dtype=torch_dtype
-    )
 
     saes = {}
     for site in suite.sites:
@@ -121,4 +159,11 @@ def load_model_and_saes(suite: Suite, device: str, dtype: str = "float32"):
                 f"Failed to load SAE {site.release}/{site.sae_id} for suite "
                 f"{suite.name!r}. Check the sae_lens catalog entry."
             ) from e
+
+    kwargs = model_load_kwargs(saes)
+    logger.info("Loading model %s on %s (no_processing + %s)",
+                suite.model_name, device, kwargs or "{}")
+    model = HookedTransformer.from_pretrained_no_processing(
+        suite.model_name, device=device, dtype=torch_dtype, **kwargs
+    )
     return model, saes

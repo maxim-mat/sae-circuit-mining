@@ -31,7 +31,7 @@ import torch
 from src.attribution.ig import integrated_gradient_grad_x
 from src.data.loaders import load_examples
 from src.metrics import get_metric
-from src.models.suites import build_suite, load_model_and_saes
+from src.models.suites import build_suite, load_model_and_saes, prepend_bos_for
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +110,9 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
         )
 
     # The SAEs were trained on activations produced with this BOS convention;
-    # dropping it leaves position 0 off-distribution. A candidate divergence
-    # from Marks, who tokenize with the bare HF tokenizer (docs/spec.md Task 13).
-    prepend_bos = getattr(next(iter(saes.values())).cfg, "prepend_bos", True)
+    # getting it wrong leaves position 0 off-distribution. pythia-marks declares
+    # prepend_bos=False, which is also what Marks' bare-HF-tokenizer loader does.
+    prepend_bos = prepend_bos_for(saes)
 
     batch = {name: list(_EMPTY_BATCH[name]) for name in NODE_SCHEMA.names}
     totals = {name: [] for name in TOTAL_EFFECT_SCHEMA.names}
