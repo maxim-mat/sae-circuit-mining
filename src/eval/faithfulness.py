@@ -76,10 +76,31 @@ def resolve_start_layer(suite, start_layer: int) -> int:
     return math.ceil(n_blocks / 3)
 
 
+def build_patch_ref(model, saes, sites, patch_batch, ablation: str) -> dict:
+    """Per-site (feature, error) ablation references from the patch batch.
+
+    Hoisted out of run_with_ablations because it does not depend on the mask:
+    the minimality sweep calls that function once per circuit node, and
+    rebuilding this each time would repeat a full patch forward plus 18 SAE
+    encode/decode passes for every node.
+    """
+    with torch.no_grad():
+        _, cache = model.run_with_cache(patch_batch,
+                                        names_filter=[s.hook for s in sites])
+    ref = {}
+    for site in sites:
+        sae = saes[site.sae_id]
+        x = cache[site.hook]
+        f = sae.encode(x)
+        ref[site.hook] = (_ablation_values(f, ablation),
+                          _ablation_values(x - sae.decode(f), ablation))
+    return ref
+
+
 def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
                        ablation: str, handle_errors: str, device: str,
                        prepend_bos: bool = True, start_layer: int = -1,
-                       invert: bool = False) -> float:
+                       invert: bool = False, patch_ref: dict | None = None) -> float:
     """Mean metric with everything outside `keep_mask` ablated.
 
     keep_mask maps site_ordinal -> set of (token_idx, feature_idx) pairs, with
@@ -116,17 +137,8 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
     # slots carrying the very information the intervention is meant to remove.
     # Wang et al. make the same choice for the same reason, ablating on a third
     # distribution p_ABC.
-    with torch.no_grad():
-        _, patch_cache = model.run_with_cache(
-            patch_batch, names_filter=[s.hook for s in ablated_sites])
-    patch_ref = {}
-    for site in ablated_sites:
-        sae = saes[site.sae_id]
-        x = patch_cache[site.hook]
-        f = sae.encode(x)
-        patch_ref[site.hook] = (_ablation_values(f, ablation),
-                                _ablation_values(x - sae.decode(f), ablation))
-    del patch_cache
+    if patch_ref is None:
+        patch_ref = build_patch_ref(model, saes, ablated_sites, patch_batch, ablation)
 
     def make_hook(site):
         sae = saes[site.sae_id]
@@ -198,7 +210,7 @@ def build_keep_mask(nodes) -> dict[int, set[tuple[int, int]]]:
 
 
 def minimality_scores(model, saes, suite, examples, keep_mask, metric_fn,
-                      f_c: float, **common) -> dict:
+                      f_c: float, seq_len: int | None = None, **common) -> dict:
     """Per-node leave-one-out: |F(C \\ {v}) - F(C)| for every v in C.
 
     An approximation of Wang et al. 2023 (arXiv:2211.00593) section 4.2, which
@@ -211,13 +223,22 @@ def minimality_scores(model, saes, suite, examples, keep_mask, metric_fn,
     are interpretability, faithfulness and completeness (section 3.2) -- so it is
     reported for the selector comparison, not for the reproduction.
     """
+    sites = [s for s in suite.sites
+             if s.block >= resolve_start_layer(suite, common.get("start_layer", -1))]
+    patch_batch = torch.cat(
+        [model.to_tokens(ex.patch_prefix, prepend_bos=common.get("prepend_bos", True))
+         for ex in examples]).to(common["device"])
+    ref = build_patch_ref(model, saes, sites, patch_batch, common["ablation"])
+
     scores = {}
     for ordinal, nodes in keep_mask.items():
         for node in nodes:
+            if seq_len is not None and node[0] >= seq_len:
+                continue        # never applied to the mask, so removing it is a no-op
             reduced = {o: set(v) for o, v in keep_mask.items()}
             reduced[ordinal].discard(node)
             f_without = run_with_ablations(model, saes, suite, examples, reduced,
-                                           metric_fn, **common)
+                                           metric_fn, patch_ref=ref, **common)
             scores[(ordinal, node[0], node[1])] = abs(f_without - f_c)
     return scores
 
@@ -245,19 +266,44 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
 
     keep_mask = build_keep_mask(circuit.nodes)
 
-    common = dict(ablation=cfg.evaluation.ablation,
-                  handle_errors=cfg.evaluation.handle_errors,
-                  device=cfg.suite.device, prepend_bos=prepend_bos,
-                  start_layer=cfg.evaluation.start_layer)
-    f_m = run_with_ablations(model, saes, suite, examples, None, metric_fn, **common)
-    f_c = run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn, **common)
-    f_empty = run_with_ablations(model, saes, suite, examples, {}, metric_fn, **common)
-    # Completeness (Marks section 3.2): the faithfulness of the circuit's COMPLEMENT.
-    # Ideal is 0 -- if ablating just the circuit destroys the behaviour, the
-    # circuit captured everything that mattered. High completeness means the
-    # model routes around the circuit, i.e. the circuit is missing something.
-    f_complement = run_with_ablations(model, saes, suite, examples, keep_mask,
-                                      metric_fn, invert=True, **common)
+    base = dict(ablation=cfg.evaluation.ablation,
+                handle_errors=cfg.evaluation.handle_errors,
+                device=cfg.suite.device, prepend_bos=prepend_bos)
+
+    # F(M) ablates nothing, so it does not depend on start_layer.
+    f_m = run_with_ablations(model, saes, suite, examples, None, metric_fn, **base)
+
+    def evaluate_at(start_layer: int) -> dict:
+        common = dict(base, start_layer=start_layer)
+        f_c = run_with_ablations(model, saes, suite, examples, keep_mask,
+                                 metric_fn, **common)
+        f_empty = run_with_ablations(model, saes, suite, examples, {},
+                                     metric_fn, **common)
+        # Completeness (Marks §3.2): the faithfulness of the circuit's COMPLEMENT.
+        # Ideal 0 -- if ablating just the circuit destroys the behaviour, the
+        # circuit captured what mattered.
+        f_complement = run_with_ablations(model, saes, suite, examples, keep_mask,
+                                          metric_fn, invert=True, **common)
+        return {"F_C": f_c, "F_empty": f_empty, "F_complement": f_complement,
+                "faithfulness": faithfulness(f_c, f_m, f_empty),
+                "completeness": faithfulness(f_complement, f_m, f_empty),
+                "start_layer": resolve_start_layer(suite, start_layer)}
+
+    # Marks' paper and code disagree about scoring the whole circuit, so report
+    # BOTH rather than let a default decide silently:
+    #   §3.2  "we ignore the first 1/3 of our circuit, and only evaluate the
+    #          latter 2/3"                              -> start_layer = ceil(n/3)
+    #   ablation.py  --start_layer default -1, filtered as `>= start_layer`,
+    #          which keeps every block                  -> start_layer = 0
+    #          (their faithfulness script also passes include_embed=False, which
+    #           our block>=0 filter reproduces, embed carrying block=-1)
+    latter_two_thirds = evaluate_at(-1)
+    all_blocks = evaluate_at(0)
+    primary = evaluate_at(cfg.evaluation.start_layer)
+
+    f_c, f_empty = primary["F_C"], primary["F_empty"]
+    f_complement = primary["F_complement"]
+    common = dict(base, start_layer=cfg.evaluation.start_layer)
 
     # Position indices only transfer if the eval split tokenises to the same
     # length the circuit was discovered at; use_min_length_only makes that true
@@ -274,17 +320,17 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
     minimality = {}
     if cfg.evaluation.minimality:
         minimality = minimality_scores(model, saes, suite, examples, keep_mask,
-                                       metric_fn, f_c, **common)
+                                       metric_fn, f_c, seq_len=seq_len, **common)
 
     result = {
-        "faithfulness": faithfulness(f_c, f_m, f_empty),
-        "completeness": faithfulness(f_complement, f_m, f_empty),
-        "F_C": f_c, "F_M": f_m, "F_empty": f_empty,
-        "F_complement": f_complement,
+        **primary,
+        "F_M": f_m,
+        # Both readings of Marks' inconsistent ⅓ rule, always reported.
+        **{f"{k}_latter_two_thirds": v for k, v in latter_two_thirds.items()},
+        **{f"{k}_all_blocks": v for k, v in all_blocks.items()},
         "n_nodes": len(circuit.nodes),
         "n_examples": len(examples),
         "n_nodes_stale": stale,
-        "start_layer": resolve_start_layer(suite, cfg.evaluation.start_layer),
         "runtime_s": round(time.time() - started, 2),
     }
     if minimality:
@@ -303,8 +349,11 @@ def run_evaluation(cfg, circuit_path: Path, out_dir: Path) -> dict:
                     result["minimality_median"],
                     100 * result["minimality_frac_nontrivial"])
     (Path(out_dir) / "faithfulness.json").write_text(json.dumps(result, indent=2))
-    logger.info("Faithfulness %.4f | completeness %.4f (ideal 0) "
-                "[F_C=%.4f F_M\\C=%.4f F_M=%.4f F_empty=%.4f]",
-                result["faithfulness"], result["completeness"],
-                f_c, f_complement, f_m, f_empty)
+    logger.info(
+        "Faithfulness/completeness — latter 2/3 (paper §3.2, from layer %d): "
+        "%.4f / %.4f | all blocks (ablation.py default): %.4f / %.4f "
+        "[F_M=%.4f]",
+        latter_two_thirds["start_layer"],
+        latter_two_thirds["faithfulness"], latter_two_thirds["completeness"],
+        all_blocks["faithfulness"], all_blocks["completeness"], f_m)
     return result
