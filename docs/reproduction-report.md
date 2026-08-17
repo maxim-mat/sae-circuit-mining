@@ -5,7 +5,30 @@ a 5-example smoke configuration (see below), but the 100-example reproduction ha
 not been executed. The results table below is still empty on purpose rather than
 filled with smoke-test numbers, which are not comparable to Marks'.
 
-## Smoke run — 2026-08-17, 5 examples
+## Smoke run — 2026-08-17, 5 examples, **after** the loader fix
+
+```
+data.num_examples=5  attribution.ig_steps=2  evaluation.num_examples=5
+```
+
+| Stage | Result |
+|---|---|
+| node_attribution | 68,770 rows, 5 examples, 0 skipped |
+| selection | 75 of 29,153 nodes |
+| edge_attribution | 338,403 edges over 31 specs |
+| circuit | **75 nodes, 317 edges** |
+| evaluation | **faithfulness 0.2110** (F_C 0.626, F_M 1.526, F_∅ 0.385) |
+
+Against Marks' **86 nodes / 0.21**. All three F terms are now positive, as the
+flipped metric orientation predicts.
+
+**This is not the reproduction.** 5 examples at 2 IG steps against their 100 at
+10, and 5 eval examples against their 40. Landing on 0.211 at this sample size
+is as much luck as signal; the 100-example run below is what settles it. What it
+does establish is that the corrected loading moved the number in the right
+direction — 0.179 → 0.211 — while node count moved 83 → 75, closer to their 86.
+
+## Superseded smoke run — before the loader fix
 
 ```
 data.num_examples=5  attribution.ig_steps=2  evaluation.num_examples=5
