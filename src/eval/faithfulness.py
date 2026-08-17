@@ -106,6 +106,27 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
     token_batch = torch.cat(
         [model.to_tokens(ex.clean_prefix, prepend_bos=prepend_bos) for ex in examples]
     ).to(device)
+    patch_batch = torch.cat(
+        [model.to_tokens(ex.patch_prefix, prepend_bos=prepend_bos) for ex in examples]
+    ).to(device)
+
+    # Reference values for ablation come from the PATCH distribution, not the
+    # clean one -- ablation.py traces `patch` to build patch_states and
+    # substitutes from those. Using clean activations would leave the ablated
+    # slots carrying the very information the intervention is meant to remove.
+    # Wang et al. make the same choice for the same reason, ablating on a third
+    # distribution p_ABC.
+    with torch.no_grad():
+        _, patch_cache = model.run_with_cache(
+            patch_batch, names_filter=[s.hook for s in ablated_sites])
+    patch_ref = {}
+    for site in ablated_sites:
+        sae = saes[site.sae_id]
+        x = patch_cache[site.hook]
+        f = sae.encode(x)
+        patch_ref[site.hook] = (_ablation_values(f, ablation),
+                                _ablation_values(x - sae.decode(f), ablation))
+    del patch_cache
 
     def make_hook(site):
         sae = saes[site.sae_id]
@@ -115,7 +136,7 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
             recon = sae.decode(feats)
             err = tensor - recon
 
-            ref = _ablation_values(feats, ablation)
+            ref, err_ref = patch_ref[site.hook]
             seq = feats.shape[1]
             if keep_mask is None:
                 new_feats = feats
@@ -143,8 +164,7 @@ def run_with_ablations(model, saes, suite, examples, keep_mask, metric_fn,
                 err_keep = torch.ones_like(err_keep)
             elif handle_errors == "remove":
                 err_keep = torch.zeros_like(err_keep)
-            new_err = torch.where(err_keep.unsqueeze(-1), err,
-                                  _ablation_values(err, ablation))
+            new_err = torch.where(err_keep.unsqueeze(-1), err, err_ref)
             return sae.decode(new_feats) + new_err
 
         return hook
