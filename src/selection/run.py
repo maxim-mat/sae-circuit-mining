@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.attribution.nodes import read_node_hive
-from src.calibrated_feature_selection import FEATURE_COLS, select_calibrated
+from src.calibrated_feature_selection import calibrated_feature_cols, select_calibrated
 from src.selection.aggregate import aggregate
 from src.selection.threshold import select_by_threshold
 
@@ -82,8 +82,10 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
         # The calibrated selector tests the raw rows, so its verdict comes back
         # keyed by (site_ordinal, feature_idx) and is joined onto the aggregate.
         feats = select_calibrated(raw, cfg)
-        nodes = nodes.merge(feats[FEATURE_COLS + ["selected"]], on=FEATURE_COLS,
-                            how="left")
+        # Join on the same unit the test used, or a feature-level verdict gets
+        # broadcast to positions it was never evidence for.
+        key = calibrated_feature_cols(cfg)
+        nodes = nodes.merge(feats[key + ["selected"]], on=key, how="left")
         nodes["selected"] = nodes["selected"].fillna(False).astype(bool)
         summary = feats.attrs.get("summary")
         if summary is not None:

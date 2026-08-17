@@ -379,6 +379,21 @@ def negative_control(df: pd.DataFrame, seed: int = 0, **kwargs) -> pd.Series:
 # Stage entry point
 # ===========================================================================
 
+def calibrated_feature_cols(cfg) -> list[str]:
+    """What counts as one testable unit, which must match what a NODE is.
+
+    With aggregation="none" a node is (site, feature, position) -- Marks'
+    templatic setting, where position i means the same thing in every example.
+    Testing recurrence over (site, feature) alone and then broadcasting the
+    verdict to every position marks a feature selected at positions where it has
+    no effect, inflating the circuit ~3x on rc and making node counts
+    incomparable to the threshold selector's.
+    """
+    if cfg.selection.aggregation == "none":
+        return FEATURE_COLS + ["token_idx"]
+    return list(FEATURE_COLS)
+
+
 def select_calibrated(nodes_raw: pd.DataFrame, cfg) -> pd.DataFrame:
     """Hypothesis-testing selection. Consumes the RAW per-(example, position,
     feature) rows, not the aggregate -- its null model is built from the
@@ -392,6 +407,7 @@ def select_calibrated(nodes_raw: pd.DataFrame, cfg) -> pd.DataFrame:
         nodes_raw,
         q=cfg.selection.screen_q,          # Stage 1: false positives per group
         n0=cfg.selection.screen_n0,        # Stage 1: MAD shrinkage pseudo-count
+        feature_cols=calibrated_feature_cols(cfg),
         fdr=cfg.selection.fdr_q,           # Stage 2: BH level across examples
         block_col=cfg.selection.block_col,
         min_recurrence_frac=cfg.selection.min_recurrence,

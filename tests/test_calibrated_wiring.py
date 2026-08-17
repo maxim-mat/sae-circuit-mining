@@ -44,3 +44,19 @@ def test_the_two_rates_are_not_the_same_field():
     """Guard the schema itself: a single field for both rates is the bug."""
     cfg = Config()
     assert cfg.selection.screen_q != cfg.selection.fdr_q
+
+
+def test_tested_unit_matches_what_a_node_is():
+    """Regression: with aggregation='none' a node is (site, feature, position).
+    Testing recurrence over (site, feature) alone and broadcasting the verdict
+    to all positions inflated the circuit 338 nodes vs 125 on rc_train n=100,
+    and made node counts incomparable to the threshold selector's."""
+    from src.calibrated_feature_selection import calibrated_feature_cols
+
+    cfg = _cfg()
+    cfg.selection.aggregation = "none"
+    assert calibrated_feature_cols(cfg) == ["site_ordinal", "feature_idx", "token_idx"]
+
+    cfg.selection.aggregation = "sum"
+    assert calibrated_feature_cols(cfg) == ["site_ordinal", "feature_idx"], \
+        "positions are summed away, so there is no position to test over"
