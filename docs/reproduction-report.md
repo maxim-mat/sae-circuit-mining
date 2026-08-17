@@ -77,7 +77,7 @@ C:/Users/Maxim/anaconda3/python.exe -m pytest tests/test_end_to_end.py -v -m slo
 
 # 2. The reproduction run: 100 examples, IG 10 steps, agg none, T_N 0.1, T_E 0.01.
 #    Matches scripts/get_circuit.sh EleutherAI/pythia-70m-deduped rc_train 0.1 0.01 none
-C:/Users/Maxim/anaconda3/python.exe -m src.main -c configs/pythia_marks_rc.yaml \
+C:/Users/Maxim/anaconda3/python.exe main.py -c configs/pythia_marks_rc.yaml \
     evaluation.num_examples=40
 ```
 

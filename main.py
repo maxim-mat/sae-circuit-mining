@@ -1,9 +1,9 @@
 """Entry point for the SAE circuit-discovery pipeline.
 
 Usage:
-    python -m src.main -c configs/pythia_marks_rc.yaml
-    python -m src.main -c configs/pythia_marks_rc.yaml selection.node_threshold=0.2
-    python -m src.main -c configs/pythia_marks_rc.yaml --stage node_attribution
+    python main.py -c configs/pythia_marks_rc.yaml
+    python main.py -c configs/pythia_marks_rc.yaml selection.node_threshold=0.2
+    python main.py -c configs/pythia_marks_rc.yaml --stage node_attribution
 """
 import logging
 import sys
