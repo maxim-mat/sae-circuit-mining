@@ -222,3 +222,7 @@ __marimo__/
 AGENTS.md
 CLAUDE.md
 /.idea
+# Raw data and pipeline outputs -- never committed. Root-anchored: a bare
+# `data/` would also swallow the src/data package.
+/data/
+/outputs/

@@ -1,0 +1,105 @@
+import json
+import pytest
+from src.data.loaders import load_sva_examples, Example
+
+
+class FakeTokenizer:
+    """Whitespace tokenizer: one token per word, so lengths are predictable."""
+    def __call__(self, text):
+        class R:
+            input_ids = list(range(len(text.split())))
+        return R()
+
+
+class FakeModel:
+    tokenizer = FakeTokenizer()
+
+
+def _write(tmp_path, rows):
+    p = tmp_path / "d.json"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    return p
+
+
+def test_reads_jsonl_despite_json_extension(tmp_path):
+    rows = [{"clean_prefix": "the boy", "clean_answer": " is",
+             "patch_prefix": "the boys", "patch_answer": " are"}]
+    ex = load_sva_examples(_write(tmp_path, rows), 10, FakeModel(),
+                           use_min_length_only=False)
+    assert len(ex) == 1
+    assert isinstance(ex[0], Example)
+    assert ex[0].clean_prefix == "the boy"
+    assert ex[0].patch_answer == " are"
+
+
+def test_drops_mismatched_prefix_lengths(tmp_path):
+    rows = [{"clean_prefix": "the boy", "clean_answer": " is",
+             "patch_prefix": "the tall boys", "patch_answer": " are"}]
+    assert load_sva_examples(_write(tmp_path, rows), 10, FakeModel(),
+                             use_min_length_only=False) == []
+
+
+def test_drops_multi_token_answers(tmp_path):
+    rows = [{"clean_prefix": "the boy", "clean_answer": " is here",
+             "patch_prefix": "the boys", "patch_answer": " are"}]
+    assert load_sva_examples(_write(tmp_path, rows), 10, FakeModel(),
+                             use_min_length_only=False) == []
+
+
+def test_min_length_only_keeps_one_length_and_restarts(tmp_path):
+    """Position alignment for aggregation='none' requires a single length.
+    A shorter example appearing later must discard everything collected so far."""
+    rows = [
+        {"clean_prefix": "a b c", "clean_answer": " x",
+         "patch_prefix": "d e f", "patch_answer": " y"},
+        {"clean_prefix": "a b", "clean_answer": " x",
+         "patch_prefix": "d e", "patch_answer": " y"},
+        {"clean_prefix": "g h", "clean_answer": " x",
+         "patch_prefix": "i j", "patch_answer": " y"},
+        {"clean_prefix": "k l m", "clean_answer": " x",
+         "patch_prefix": "n o p", "patch_answer": " y"},
+    ]
+    ex = load_sva_examples(_write(tmp_path, rows), 10, FakeModel(),
+                           use_min_length_only=True, shuffle=False)
+    assert len(ex) == 2
+    assert {e.clean_prefix for e in ex} == {"a b", "g h"}
+
+
+def test_respects_num_examples(tmp_path):
+    rows = [{"clean_prefix": "a b", "clean_answer": " x",
+             "patch_prefix": "c d", "patch_answer": " y"} for _ in range(10)]
+    assert len(load_sva_examples(_write(tmp_path, rows), 3, FakeModel(),
+                                 use_min_length_only=False)) == 3
+
+
+def test_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_sva_examples(tmp_path / "nope.json", 1, FakeModel())
+
+
+# -- one counterfactual per run -------------------------------------------
+
+from src.data.loaders import select_counterfactual
+
+
+def test_selects_only_the_designated_counterfactual():
+    """A run is scoped to one counterfactual: causal questions do not mix."""
+    item = {"prompt": "clean text",
+            "abc": {"prompt": "abc text"},
+            "name_swap": {"prompt": "swapped text"}}
+    cf = select_counterfactual(item, "abc")
+    assert cf["prompt"] == "abc text"
+
+
+def test_missing_counterfactual_lists_what_is_available():
+    item = {"prompt": "clean", "abc": {"prompt": "x"}, "name_swap": {"prompt": "y"}}
+    with pytest.raises(ValueError, match="abc.*name_swap|name_swap.*abc"):
+        select_counterfactual(item, "no_such_cf")
+
+
+def test_unset_counterfactual_is_an_error_not_a_silent_pick():
+    """Defaulting to 'the first one' would silently answer a different causal
+    question than the config names."""
+    item = {"prompt": "clean", "abc": {"prompt": "x"}}
+    with pytest.raises(ValueError):
+        select_counterfactual(item, None)
