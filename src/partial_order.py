@@ -3,31 +3,31 @@ Part 2 — partial-order construction and Petri-net discovery.
 
 Consumes the event log written by Part 1 (calibrated_feature_selection.py):
     event_logs/eventlog/counterfactual=<cf>/  with columns
-      prompt_idx, layer, token_idx, token_id, feature_idx, attribution,
+      example_idx, site_ordinal, token_idx, token_id, feature_idx, attribution,
       abs_attr, sign
 plus an EDGE-ATTRIBUTION table (computed by a separate model pass — see
 compute_edge_attributions docstring) with columns
-      prompt_idx, src_layer, src_feat, dst_layer, dst_feat, edge_ie
+      example_idx, src_ordinal, src_feat, dst_ordinal, dst_feat, edge_ie
 and produces a directly-follows graph (DFG) for the inductive miner (IM-f).
 
 Design (per case = per prompt; token positions collapsed):
 
-  1. Events.  Node identity is (layer, feature_idx) — a feature index is only
-     unique within its layer. A feature firing at several token positions in
-     one prompt is ONE prompt-level event. Same-layer nodes read the same
-     residual state (gpt2-small-res-jb hooks the residual stream once/layer),
-     so no edge can ever run between them: within-layer incomparability is
-     architectural, and all ordering lives on cross-layer pairs.
+  1. Events.  Node identity is (site_ordinal, feature_idx) — a feature index is only
+     unique within its site. A feature firing at several token positions in
+     one prompt is ONE prompt-level event. Same-site nodes read the same
+     residual state (gpt2-small-res-jb hooks the residual stream once per site),
+     so no edge can ever run between them: within-site incomparability is
+     architectural, and all ordering lives on cross-site pairs.
 
-  2. Edges.  Cross-layer candidate pairs (src_layer < dst_layer) get an edge
+  2. Edges.  Cross-site candidate pairs (src_ordinal < dst_ordinal) get an edge
      IE (stop-gradient chain rule). Optional second calibrated screen on
      |edge_ie|, reusing Part 1's MAD machinery with groups = (case,
-     layer-pair) — toggleable, OFF by default.
+     site-pair) — toggleable, OFF by default.
 
-  3. Order.  Screened edges form a down-layer DAG. Its transitive reduction
+  3. Order.  Screened edges form a down-site DAG. Its transitive reduction
      (Hasse diagram) is the "directly-causes" relation = the honest analogue
      of directly-follows. Two events are concurrent in a case iff no directed
-     path connects them (includes all co-occurring same-layer pairs).
+     path connects them (includes all co-occurring same-site pairs).
 
   4. DFG.   Hasse edge a->b            => directly-follows a>b, weight ~|edge IE|
             concurrent co-occurring {a,b} => BOTH a>b and b>a (interleaving
@@ -54,10 +54,15 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
-from sae_layers import sae_layer_ordinal
+from src.models.suites import build_suite
 
-EVENT_KEY = ["prompt_idx", "layer", "feature_idx"]
-EDGE_COLS = ["prompt_idx", "src_layer", "src_feat", "dst_layer", "dst_feat", "edge_ie"]
+# NOTE: attn and mlp sites at the same block are CONCURRENT when
+# Suite.parallel_attn is True; their consecutive ordinals are a linearisation.
+# The Petri-net work must read `kind`/`block` and the suite's parallel_attn
+# flag rather than treating site_ordinal as a genuine total order.
+
+EVENT_KEY = ["example_idx", "site_ordinal", "feature_idx"]
+EDGE_COLS = ["example_idx", "src_ordinal", "src_feat", "dst_ordinal", "dst_feat", "edge_ie"]
 
 
 # ===========================================================================
@@ -65,7 +70,7 @@ EDGE_COLS = ["prompt_idx", "src_layer", "src_feat", "dst_layer", "dst_feat", "ed
 # ===========================================================================
 
 def prompt_events(event_log: pd.DataFrame) -> pd.DataFrame:
-    """Collapse the per-(token) event log to per-(prompt, layer, feature)
+    """Collapse the per-(token) event log to per-(example, site, feature)
     events. Aggregates the multiple token-position rows of a feature within a
     prompt: event magnitude = summed |attribution|, event sign = sign of the
     signed sum (net direction of the feature's contribution in that prompt)."""
@@ -76,31 +81,31 @@ def prompt_events(event_log: pd.DataFrame) -> pd.DataFrame:
         n_positions=("token_idx", "nunique"),
     ).reset_index()
     ev["sign"] = np.sign(ev["signed"]).astype(np.int8)
-    ev["node"] = list(zip(ev["layer"], ev["feature_idx"]))
+    ev["node"] = list(zip(ev["site_ordinal"], ev["feature_idx"]))
     return ev
 
 
-def activity_label(layer: int, feat: int) -> str:
+def activity_label(site_ordinal: int, feat: int) -> str:
     """Human-readable, miner-friendly activity id for a node."""
-    return f"L{int(layer):02d}.F{int(feat)}"
+    return f"L{int(site_ordinal):02d}.F{int(feat)}"
 
 
 # ===========================================================================
-# Candidate edges — the cross-layer pairs whose edge IE the model pass needs
+# Candidate edges — the cross-site pairs whose edge IE the model pass needs
 # ===========================================================================
 
 def candidate_edges(event_log: pd.DataFrame) -> pd.DataFrame:
-    """Per prompt, all ordered cross-layer pairs (src_layer < dst_layer) of
+    """Per prompt, all ordered cross-site pairs (src_ordinal < dst_ordinal) of
     selected features. This is exactly the set compute_edge_attributions must
-    score — same-layer pairs are excluded (architecturally incomparable)."""
+    score — same-site pairs are excluded (architecturally incomparable)."""
     ev = prompt_events(event_log)
     out = []
-    for pid, g in ev.groupby("prompt_idx", sort=False):
-        recs = sorted(g[["layer", "feature_idx"]].itertuples(index=False),
-                      key=lambda r: r.layer)
+    for pid, g in ev.groupby("example_idx", sort=False):
+        recs = sorted(g[["site_ordinal", "feature_idx"]].itertuples(index=False),
+                      key=lambda r: r.site_ordinal)
         for a, b in itertools.combinations(recs, 2):
-            if a.layer < b.layer:               # strict: no same-layer edges
-                out.append((pid, a.layer, a.feature_idx, b.layer, b.feature_idx))
+            if a.site_ordinal < b.site_ordinal:               # strict: no same-site edges
+                out.append((pid, a.site_ordinal, a.feature_idx, b.site_ordinal, b.feature_idx))
     return pd.DataFrame(out, columns=EDGE_COLS[:-1])
 
 
@@ -111,7 +116,7 @@ def candidate_edges(event_log: pd.DataFrame) -> pd.DataFrame:
 # The only edge estimate computable WITHOUT re-running the model is the
 # virtual weight: feature a writes W_dec[a] into the residual stream, feature
 # b reads it via its encoder row, so the linear a->b coupling is
-#       vw(a->b) = W_dec[src_layer][a] . W_enc[dst_layer][:, b].
+#       vw(a->b) = W_dec[src_ordinal][a] . W_enc[dst_ordinal][:, b].
 # It captures the direct residual path only (NOT attention-mediated cross-
 # position routing) — a documented approximation of the stop-gradient IE.
 # We make it per-prompt by routing through a's stored node IE:
@@ -119,27 +124,25 @@ def candidate_edges(event_log: pd.DataFrame) -> pd.DataFrame:
 #
 # Density warning: vw is nonzero for nearly every pair. Emitting all pairs
 # makes each case's DAG near-complete, so transitive reduction collapses the
-# partial order to the trivial layer order. Hence top_k_parents density
+# partial order to the trivial site order. Hence top_k_parents density
 # control is ON by default for the post-hoc path.
 
-def load_sae_directions(release: str, device: str = "cpu") -> dict:
-    """Load per-layer encoder/decoder directions for the residual-stream SAEs,
-    mirroring main.py's release handling. Returns
-        {layer: {"W_enc": (d_model, d_sae), "W_dec": (d_sae, d_model)}}
+def load_sae_directions(suite_name: str, device: str = "cpu") -> dict:
+    """Load per-site encoder/decoder directions for a suite's SAEs. Returns
+        {site_ordinal: {"W_enc": (d_model, d_sae), "W_dec": (d_sae, d_model)}}
     as numpy float32 arrays. Requires sae_lens (run in the user's env)."""
     from sae_lens import SAE
-    from sae_lens.loading.pretrained_saes_directory import get_pretrained_saes_directory
 
-    saes_map = get_pretrained_saes_directory()[release].saes_map
     dirs = {}
-    for sid in saes_map:
-        layer = sae_layer_ordinal(sid)
-        sae = SAE.from_pretrained(release=release, sae_id=sid, device=device)[0]
+    for site in build_suite(suite_name).sites:
+        site_ordinal = site.ordinal
+        sae = SAE.from_pretrained(release=site.release, sae_id=site.sae_id,
+                                  device=device)[0]
         W_enc = sae.W_enc.detach().cpu().float().numpy()          # (d_model, d_sae)
         W_dec = sae.W_dec.detach().cpu().float().numpy()          # (d_sae, d_model)
         if W_dec.shape[0] != W_enc.shape[1]:                      # guard orientation
             W_dec = W_dec.T
-        dirs[layer] = {"W_enc": W_enc, "W_dec": W_dec}
+        dirs[site_ordinal] = {"W_enc": W_enc, "W_dec": W_dec}
     return dirs
 
 
@@ -149,7 +152,7 @@ def compute_edge_attributions(
     weighting: str = "upstream",
     top_k_parents: int | None = 3,
 ) -> pd.DataFrame:
-    """Post-hoc virtual-weight edge IEs for all cross-layer candidate pairs.
+    """Post-hoc virtual-weight edge IEs for all cross-site candidate pairs.
 
     weighting:
       "upstream" — edge_ie = vw(a->b) * node_ie(a)   (default; per-prompt,
@@ -166,17 +169,17 @@ def compute_edge_attributions(
     ev = ev.assign(node_ie=ev["signed"].to_numpy())
     out = []
 
-    for pid, g in ev.groupby("prompt_idx", sort=False):
-        by_layer = {int(l): sub for l, sub in g.groupby("layer", sort=False)}
-        layers = sorted(by_layer)
+    for pid, g in ev.groupby("example_idx", sort=False):
+        by_site_ordinal = {int(l): sub for l, sub in g.groupby("site_ordinal", sort=False)}
+        layers = sorted(by_site_ordinal)
         for i, ls in enumerate(layers):
-            src = by_layer[ls]
+            src = by_site_ordinal[ls]
             Wd = sae_dirs[ls]["W_dec"]                       # (d_sae, d_model)
             s_feats = src["feature_idx"].to_numpy()
             s_ie = src["node_ie"].to_numpy()
             Wd_s = Wd[s_feats]                               # (n_src, d_model)
             for ld in layers[i + 1:]:
-                dst = by_layer[ld]
+                dst = by_site_ordinal[ld]
                 We = sae_dirs[ld]["W_enc"]                   # (d_model, d_sae)
                 d_feats = dst["feature_idx"].to_numpy()
                 We_d = We[:, d_feats]                        # (d_model, n_dst)
@@ -214,7 +217,7 @@ def screen_edges(
     """Add a 'kept_edge' column. If disabled, keep every candidate edge.
 
     IMPORTANT — why this is NOT the node MAD screen. Part 1's node screen is a
-    NOISE-FLOOR test: it works because each (prompt, layer) group is ~99%
+    NOISE-FLOOR test: it works because each (prompt, site_ordinal) group is ~99%
     task-irrelevant features, so median/MAD estimate the noise bulk. The edge
     candidate set is the opposite regime: candidate_edges() only pairs
     features that ALREADY survived node selection, so most candidate edges are
@@ -225,8 +228,8 @@ def screen_edges(
     chains. (This was verified empirically; see the design notes.)
 
     The appropriate edge gate is therefore RELATIVE MAGNITUDE, not a noise
-    test: within each layer-pair, drop edges whose |edge_ie| is below
-    rel_threshold * median(|edge_ie|) for that layer-pair. This removes only
+    test: within each site-pair, drop edges whose |edge_ie| is below
+    rel_threshold * median(|edge_ie|) for that site-pair. This removes only
     the weakest mediated/leak edges (e.g. a direct a->c that is really a->b->c)
     while preserving the causal backbone, and it lets transitive reduction do
     the rest. OFF by default; the unscreened DAG + transitive reduction is
@@ -237,8 +240,8 @@ def screen_edges(
         edges["kept_edge"] = True
         return edges
 
-    edges["_pair"] = (edges["src_layer"].astype(int) * 1000
-                      + edges["dst_layer"].astype(int))
+    edges["_pair"] = (edges["src_ordinal"].astype(int) * 1000
+                      + edges["dst_ordinal"].astype(int))
     absie = edges["edge_ie"].abs()
     pair_med = edges.assign(_a=absie).groupby("_pair")["_a"].transform("median")
     edges["kept_edge"] = absie >= rel_threshold * pair_med
@@ -250,17 +253,17 @@ def screen_edges(
 # ===========================================================================
 
 def case_dag(ev_case: pd.DataFrame, edges_case: pd.DataFrame) -> nx.DiGraph:
-    """Build one prompt's causal DAG. Nodes = (layer, feature_idx) events;
-    edges = kept cross-layer edges among present nodes (down-layer only)."""
+    """Build one prompt's causal DAG. Nodes = (site_ordinal, feature_idx) events;
+    edges = kept cross-site edges among present nodes (down-site only)."""
     g = nx.DiGraph()
     for r in ev_case.itertuples(index=False):
-        g.add_node((int(r.layer), int(r.feature_idx)), layer=int(r.layer),
+        g.add_node((int(r.site_ordinal), int(r.feature_idx)), site_ordinal=int(r.site_ordinal),
                    sign=int(r.sign), abs_attr=float(r.abs_attr))
     for r in edges_case.itertuples(index=False):
         if not getattr(r, "kept_edge", True):
             continue
-        s, d = (int(r.src_layer), int(r.src_feat)), (int(r.dst_layer), int(r.dst_feat))
-        if g.has_node(s) and g.has_node(d) and r.src_layer < r.dst_layer:
+        s, d = (int(r.src_ordinal), int(r.src_feat)), (int(r.dst_ordinal), int(r.dst_feat))
+        if g.has_node(s) and g.has_node(d) and r.src_ordinal < r.dst_ordinal:
             g.add_edge(s, d, weight=abs(float(r.edge_ie)))
     return g
 
@@ -269,7 +272,7 @@ def case_relations(g: nx.DiGraph):
     """Return (hasse_edges, concurrent_pairs) for one case.
     hasse: transitive reduction = directly-causes.
     concurrent: co-occurring node pairs with no directed path either way
-    (includes all same-layer pairs)."""
+    (includes all same-site pairs)."""
     hasse = set(nx.transitive_reduction(g).edges()) if g.number_of_edges() else set()
     reach = {n: nx.descendants(g, n) for n in g.nodes()}
     concurrent = set()
@@ -317,8 +320,8 @@ def build_dfg(
     starts, ends = defaultdict(float), defaultdict(float)
     n_cases = n_hasse = n_conc = 0
 
-    ev_by_case = dict(tuple(ev.groupby("prompt_idx", sort=False)))
-    ed_by_case = dict(tuple(edges.groupby("prompt_idx", sort=False))) if len(edges) else {}
+    ev_by_case = dict(tuple(ev.groupby("example_idx", sort=False)))
+    ed_by_case = dict(tuple(edges.groupby("example_idx", sort=False))) if len(edges) else {}
     empty_edges = edges.iloc[0:0]
 
     for pid, ev_case in ev_by_case.items():
@@ -424,8 +427,8 @@ def case_traces(
     rng = np.random.default_rng(seed)
     ev = prompt_events(event_log)
     edges = screen_edges(edges, enabled=screen_edges_enabled, rel_threshold=rel_threshold)
-    ev_by_case = dict(tuple(ev.groupby("prompt_idx", sort=False)))
-    ed_by_case = dict(tuple(edges.groupby("prompt_idx", sort=False))) if len(edges) else {}
+    ev_by_case = dict(tuple(ev.groupby("example_idx", sort=False)))
+    ed_by_case = dict(tuple(edges.groupby("example_idx", sort=False))) if len(edges) else {}
     empty = edges.iloc[0:0]
 
     rows = []
@@ -484,7 +487,7 @@ def load_event_log(path: str) -> pd.DataFrame:
     """Load a Part-1 event log: the hive partition dir
     event_logs/eventlog/counterfactual=<cf>/ (or a single parquet file)."""
     df = pd.read_parquet(path)
-    needed = {"prompt_idx", "layer", "token_idx", "feature_idx", "attribution"}
+    needed = {"example_idx", "site_ordinal", "token_idx", "feature_idx", "attribution"}
     missing = needed - set(df.columns)
     if missing:
         raise ValueError(f"event log missing columns: {missing}")
@@ -526,8 +529,8 @@ def run(
         cf = os.path.basename(event_log_path.rstrip("/\\")).split("=")[-1]
     ev = prompt_events(event_log)
     print(f"[{cf}] {len(event_log):,} log rows -> {len(ev):,} prompt-events "
-          f"over {ev['prompt_idx'].nunique()} prompts, "
-          f"{ev.groupby('layer').ngroups} layers")
+          f"over {ev['example_idx'].nunique()} prompts, "
+          f"{ev.groupby('site_ordinal').ngroups} layers")
 
     print(f"[{cf}] loading SAE directions ({release}) ...")
     sae_dirs = load_sae_directions(release, device=device)
@@ -598,16 +601,16 @@ def _selftest():
                 v = rng.lognormal(-4, 0.5)
                 ev_rows.append((case, l, tok, 50256, f, v, v, 1))
     event_log = pd.DataFrame(ev_rows, columns=[
-        "prompt_idx", "layer", "token_idx", "token_id", "feature_idx",
+        "example_idx", "site_ordinal", "token_idx", "token_id", "feature_idx",
         "attribution", "abs_attr", "sign"])
 
     edges = compute_edge_attributions(event_log, sae_dirs, top_k_parents=3)
     laA, laM, laD = activity_label(*A), activity_label(*M), activity_label(*D)
     # inspect magnitudes: planted A>M and M>D should dominate the noise A>D
-    mag = (edges.assign(p=edges.src_layer.astype(str) + ">" + edges.dst_layer.astype(str))
+    mag = (edges.assign(p=edges.src_ordinal.astype(str) + ">" + edges.dst_ordinal.astype(str))
            .groupby("p")["edge_ie"].apply(lambda s: s.abs().mean()))
     dfg, starts, ends, stats = build_dfg(event_log, edges, screen_edges_enabled=True)
-    print("mean |edge_ie| by layer-pair:", {k: round(v, 4) for k, v in mag.items()})
+    print("mean |edge_ie| by site-pair:", {k: round(v, 4) for k, v in mag.items()})
     print("stats:", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in stats.items()})
     print("chain A>M>D recovered:",
           (laA, laM) in dfg and (laM, laD) in dfg
