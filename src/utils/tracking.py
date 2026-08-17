@@ -21,11 +21,18 @@ def init_tracking(cfg):
         return None
     import wandb
     _run = wandb.init(
-        project=cfg.logging.project, entity=cfg.logging.entity,
-        name=cfg.logging.run_name, group=cfg.logging.group,
+        project=cfg.logging.project,
+        group=cfg.logging.experiment,     # one comparison
+        name=cfg.logging.run_name,        # one arm of it
+        entity=cfg.logging.entity,
+        tags=list(cfg.logging.tags) or None,
+        notes=cfg.logging.notes,
         mode="offline" if cfg.logging.offline else "online",
         config=OmegaConf.to_container(OmegaConf.structured(cfg), resolve=True),
     )
+    logger.info("wandb: %s/%s | experiment=%s | run=%s",
+                cfg.logging.entity or "-", cfg.logging.project,
+                cfg.logging.experiment, _run.name)
     return _run
 
 

@@ -18,7 +18,11 @@ class DataConfig:
     """Dataset selection and the filtering that makes token positions align."""
     path: str = MISSING          # jsonl path (Marks SVA) or HF dataset id (MIB)
     loader: str = "sva"          # "sva" | "mib"
-    num_examples: int = 100
+    # None = no cap, i.e. every example surviving the filters. Marks sample:
+    # their get_circuit.sh uses 100 of rc_train's 105,600 rows, of which
+    # ~77,764 clear the min-length filter, so None here is ~650 GPU-hours
+    # at ig_steps=10. Viable for the small structures, not for rc.
+    num_examples: Optional[int] = 100
     use_min_length_only: bool = True   # required for aggregation="none"
     max_length: Optional[int] = None
     text_column: Optional[str] = None  # mib only
@@ -77,7 +81,9 @@ class EdgeConfig:
 class EvalConfig:
     enabled: bool = True
     data_path: Optional[str] = None    # defaults to the *_test split of data.path
-    num_examples: int = 100
+    # None = no cap. Note run_with_ablations puts every eval example in ONE
+    # batched forward, so this is bounded by memory, not just time.
+    num_examples: Optional[int] = 100
     ablation: str = "mean"             # "mean" | "resample" | "zero"
     handle_errors: str = "default"     # "default" | "keep" | "remove"
     start_layer: int = -1
@@ -85,11 +91,19 @@ class EvalConfig:
 
 @dataclass
 class LoggingConfig:
+    """Experiment tracking. The three names form wandb's hierarchy:
+    project (the whole line of work) > experiment (one comparison, wandb's
+    `group`) > run_name (this arm of it, wandb's `name`). Set all three
+    explicitly in a config -- a null run_name gets a random wandb codename,
+    which makes two arms of the same comparison indistinguishable in the UI.
+    """
     backend: List[str] = field(default_factory=lambda: [])   # [] | ["wandb"]
     project: str = "sae-circuit-mining"
+    experiment: Optional[str] = None     # -> wandb group
+    run_name: Optional[str] = None       # -> wandb name
     entity: Optional[str] = None
-    run_name: Optional[str] = None
-    group: Optional[str] = None
+    tags: List[str] = field(default_factory=lambda: [])
+    notes: Optional[str] = None
     offline: bool = False
 
 

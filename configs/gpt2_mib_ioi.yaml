@@ -22,5 +22,9 @@ evaluation:
   enabled: false
 logging:
   backend: [wandb]
-  group: gpt2-baseline
+  project: sae-circuit-mining
+  entity: maxim0
+  experiment: gpt2-mib-baseline
+  run_name: gpt2-ioi-abc-calibrated
+  tags: [gpt2-small, mib, ioi]
 seed: 42

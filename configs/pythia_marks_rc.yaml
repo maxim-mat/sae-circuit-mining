@@ -24,5 +24,10 @@ evaluation:
   ablation: mean
 logging:
   backend: [wandb]
-  group: marks-repro
+  project: sae-circuit-mining
+  entity: maxim0
+  experiment: marks-repro-rc          # the comparison this run belongs to
+  run_name: marks-threshold-rc-n100   # this arm of it
+  tags: [pythia-70m, sva, rc, threshold]
+  notes: "Marks et al. reproduction: |mean IE| > 0.1, T_E 0.01, agg none."
 seed: 42

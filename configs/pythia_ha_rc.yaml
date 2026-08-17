@@ -40,5 +40,10 @@ evaluation:
   ablation: mean
 logging:
   backend: [wandb]
-  group: ha-vs-marks
+  project: sae-circuit-mining
+  entity: maxim0
+  experiment: marks-repro-rc          # SAME experiment as the Marks arm
+  run_name: ha-calibrated-rc-n100     # this arm of it
+  tags: [pythia-70m, sva, rc, calibrated]
+  notes: "Paired arm: hypothesis-testing selection, all else identical."
 seed: 42

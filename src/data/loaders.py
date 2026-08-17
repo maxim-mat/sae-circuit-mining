@@ -26,7 +26,7 @@ class Example:
     meta: dict = field(default_factory=dict)
 
 
-def load_sva_examples(path, num_examples: int, model, use_min_length_only: bool = True,
+def load_sva_examples(path, num_examples: int | None, model, use_min_length_only: bool = True,
                       max_length: int | None = None, seed: int = 12,
                       shuffle: bool = True) -> list[Example]:
     """Load Marks' subject-verb agreement stimuli (jsonl, despite the .json name).
@@ -97,7 +97,7 @@ def load_sva_examples(path, num_examples: int, model, use_min_length_only: bool 
             meta={k: v for k, v in data.items() if k not in
                   ("clean_prefix", "clean_answer", "patch_prefix", "patch_answer")},
         ))
-        if len(examples) >= num_examples:
+        if num_examples is not None and len(examples) >= num_examples:
             break
     logger.info("Loaded %d examples from %s", len(examples), path)
     return examples
@@ -124,7 +124,7 @@ def select_counterfactual(item: dict, name: str | None) -> dict:
     return item[name]
 
 
-def load_mib_examples(path: str, num_examples: int, model, counterfactual: str,
+def load_mib_examples(path: str, num_examples: int | None, model, counterfactual: str,
                       split: str = "train",
                       text_column: str | None = None) -> list[Example]:
     """Load a MIB-bench dataset, scoped to a single counterfactual.
@@ -155,7 +155,7 @@ def load_mib_examples(path: str, num_examples: int, model, counterfactual: str,
             meta={"source_idx": idx, "template": item.get("template", ""),
                   "choices": item.get("choices"), "answerKey": item.get("answerKey")},
         ))
-        if len(examples) >= num_examples:
+        if num_examples is not None and len(examples) >= num_examples:
             break
     logger.info("Loaded %d examples from %s (counterfactual=%s)",
                 len(examples), path, counterfactual)

@@ -41,12 +41,12 @@ def parse_args():
     # Its own file, overwritten per run: prepending into a curated document
     # duplicates that document's headings and grows it without bound.
     p.add_argument("--out", type=Path, default=Path("docs/sae-reconstruction.md"))
-    # GPU courtesy: this is a diagnostic, not a training job, and it should not
-    # evict whatever else is resident. One sequence at a time keeps the working
-    # set at seq_len x d_model per site; the allocator cap is a hard ceiling in
-    # case a future edit forgets that.
-    p.add_argument("--gpu-mem-fraction", type=float, default=0.25,
-                   help="Cap this process's share of GPU memory (0 = uncapped).")
+    # Uncapped by default: on a dedicated/remote box there is nothing to be
+    # polite to. Opt in when sharing a local GPU with something else. The script
+    # is light regardless -- one sequence at a time keeps the working set at
+    # seq_len x d_model per site.
+    p.add_argument("--gpu-mem-fraction", type=float, default=0.0,
+                   help="Cap this process's share of GPU memory (0 = uncapped, default).")
     # The BOS position carries an enormous, atypical activation that SAEs
     # reconstruct badly; including it depresses variance explained at every site
     # and is not what published SAE evaluations report.

@@ -103,3 +103,24 @@ def test_unset_counterfactual_is_an_error_not_a_silent_pick():
     item = {"prompt": "clean", "abc": {"prompt": "x"}}
     with pytest.raises(ValueError):
         select_counterfactual(item, None)
+
+
+def test_num_examples_none_takes_everything(tmp_path):
+    """Marks cap at 100; None means the whole surviving set. On rc_train that is
+    ~77,764 examples, so this is a real mode for the small structures and a
+    650-GPU-hour mistake for rc -- see DataConfig.num_examples."""
+    rows = [{"clean_prefix": f"a{i} b", "clean_answer": " x",
+             "patch_prefix": f"c{i} d", "patch_answer": " y"} for i in range(7)]
+    ex = load_sva_examples(_write(tmp_path, rows), None, FakeModel(),
+                           use_min_length_only=False)
+    assert len(ex) == 7
+
+
+def test_num_examples_none_still_honours_the_other_filters(tmp_path):
+    rows = [{"clean_prefix": "a b", "clean_answer": " x",
+             "patch_prefix": "c d", "patch_answer": " y"},
+            {"clean_prefix": "a b", "clean_answer": " two words",
+             "patch_prefix": "c d", "patch_answer": " y"}]
+    ex = load_sva_examples(_write(tmp_path, rows), None, FakeModel(),
+                           use_min_length_only=False)
+    assert len(ex) == 1, "the multi-token answer must still be dropped"
