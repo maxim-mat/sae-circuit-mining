@@ -26,14 +26,19 @@ def aggregate(df: pd.DataFrame, mode: str) -> pd.DataFrame:
 
     n_examples = df["example_idx"].nunique()
     if mode == "sum":
-        per_example = (df.groupby(KEY_COLS + ["example_idx"], sort=False)["attribution"]
+        per_example = (df.groupby(KEY_COLS + ["example_idx"], sort=False,
+                                  observed=True)["attribution"]
                          .sum().reset_index())
         keys = KEY_COLS
     else:
         per_example = df
         keys = KEY_COLS + ["token_idx"]
 
-    out = (per_example.groupby(keys, sort=False)["attribution"].sum() / n_examples)
+    # observed=True: KEY_COLS includes `kind`, which read_node_hive leaves
+    # categorical for memory. Without this the groupby materialises every
+    # (kind x site x feature x position) combination that never occurred.
+    out = (per_example.groupby(keys, sort=False, observed=True)["attribution"].sum()
+           / n_examples)
     out = out.rename("ie").reset_index()
     if mode == "sum":
         out["token_idx"] = -1

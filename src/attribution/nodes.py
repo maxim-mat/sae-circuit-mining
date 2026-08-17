@@ -70,8 +70,13 @@ EXAMPLE_SCHEMA = pa.schema([
 _EMPTY_BATCH = {name: [] for name in NODE_SCHEMA.names}
 CHUNK_SIZE = 10          # examples between parquet flushes
 
+# `kind` stays CATEGORICAL: as object it is one Python str per row, 71MB of a
+# 101MB frame at n=100 and 7 of 10.1GB at n=10k. The integer partition keys are
+# cast back to ints because they are grouped on all over the selection code;
+# `kind` is only ever a groupby key in src.selection.aggregate, which passes
+# observed=True. See read_node_hive.
 _NODE_DTYPES = {"example_idx": "int32", "site_ordinal": "int16", "block": "int16",
-                "kind": "object", "token_idx": "int16", "token_id": "int32",
+                "kind": "category", "token_idx": "int16", "token_id": "int32",
                 "feature_idx": "int32", "attribution": "float32"}
 
 
@@ -83,8 +88,12 @@ def read_node_hive(node_dir: Path) -> pd.DataFrame:
     grouping on a Categorical materialises the FULL CARTESIAN PRODUCT of category
     levels, inventing a zero-valued row for every (kind x site x feature x
     position) combination that never occurred. On a 5-example run that turned
-    96,574 real rows into 58,194,948. Cast them back here, once, rather than
-    hunting observed=True through every consumer.
+    96,574 real rows into 58,194,948.
+
+    The integer keys are therefore cast back to ints, since GROUP_COLS and
+    FEATURE_COLS are grouped on throughout the selection code. `kind` is the one
+    exception -- it is 70% of the frame as object, and the only groupby that uses
+    it as a key is src.selection.aggregate, which passes observed=True.
     """
     df = pd.read_parquet(Path(node_dir) / "nodes")
     return df.astype({c: t for c, t in _NODE_DTYPES.items() if c in df.columns})

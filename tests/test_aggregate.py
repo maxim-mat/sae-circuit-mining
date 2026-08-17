@@ -1,5 +1,6 @@
 import pandas as pd
 import pytest
+from src.attribution.nodes import NODE_SCHEMA
 from src.selection.aggregate import aggregate
 
 
@@ -58,12 +59,18 @@ def test_unknown_mode_raises():
 
 def test_hive_categorical_partitions_do_not_explode_the_row_count(tmp_path):
     """Regression: pyarrow returns hive partition keys as Categoricals, and
-    groupby(observed=False) then materialises the full cartesian product of
-    category levels. On a real 5-example run that turned 96,574 rows into
-    58,194,948. src.attribution.nodes.read_node_hive casts them back."""
+    groupby's default observed=False then materialises the full cartesian product
+    of category levels. On a real 5-example run that turned 96,574 rows into
+    58,194,948.
+
+    Closed in two places, and this asserts the invariant rather than either
+    mechanism: read_node_hive casts the integer keys back to ints, and aggregate
+    passes observed=True for `kind`, which stays categorical because as object it
+    is 70% of the frame.
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from src.attribution.nodes import NODE_SCHEMA, read_node_hive
+    from src.attribution.nodes import read_node_hive
 
     rows = {
         "example_idx": [0, 0, 1], "site_ordinal": [1, 3, 1], "block": [0, 1, 0],
@@ -75,12 +82,20 @@ def test_hive_categorical_partitions_do_not_explode_the_row_count(tmp_path):
                         root_path=str(tmp_path / "nodes"),
                         partition_cols=["kind", "site_ordinal"])
 
-    straight = pd.read_parquet(tmp_path / "nodes")
-    assert isinstance(straight["kind"].dtype, pd.CategoricalDtype), \
-        "if pyarrow stops returning Categoricals this guard is moot"
-    assert len(aggregate(straight, "none")) > 2, "the trap should still be real"
+    df = read_node_hive(tmp_path)
+    assert isinstance(df["kind"].dtype, pd.CategoricalDtype),         "kind stays categorical: as object it dominates the frame's memory"
+    assert df["site_ordinal"].dtype == "int16",         "integer keys are cast back, since the selection code groups on them"
 
-    fixed = read_node_hive(tmp_path)
-    out = aggregate(fixed, "none")
-    assert len(out) == 2, f"expected the 2 real nodes, got {len(out)}"
-    assert set(out["kind"]) == {"attn", "mlp"}
+    for mode, expected in (("none", 2), ("sum", 2)):
+        out = aggregate(df, mode)
+        assert len(out) == expected, f"{mode}: expected {expected} nodes, got {len(out)}"
+    assert set(aggregate(df, "none")["kind"]) == {"attn", "mlp"}
+
+
+def test_kind_as_object_would_dominate_the_frame():
+    """Why kind is left categorical rather than cast to object like the rest:
+    measured at 71MB of a 101MB frame at n=100, i.e. 7 of 10.1GB at n=10k."""
+    df = _df([[0, 3, 1, "resid", 0, 7, 0.5]] * 2000)
+    as_obj = df.astype({"kind": "object"})["kind"].memory_usage(deep=True)
+    as_cat = df.astype({"kind": "category"})["kind"].memory_usage(deep=True)
+    assert as_obj > 10 * as_cat
