@@ -1,12 +1,12 @@
-"""Checks integrated_gradient_grad_x from main.py with a fake model, so it does
-not need GPT-2/SAEs. Run: python src/test_ig.py
+"""Checks integrated_gradient_grad_x with a fake model, so it does not need
+GPT-2/SAEs.
 
 Validates the path interpolation, per-step gradient isolation, and averaging by
 comparing against closed-form integrated gradients for known metrics.
 """
 import torch
 
-from main import integrated_gradient_grad_x
+from src.attribution.ig import integrated_gradient_grad_x
 
 
 class FakeModel:
@@ -21,11 +21,12 @@ class FakeModel:
 
 
 def make_metric(kind, W):
-    def metric_fn(logits, tokens, item, model):
+    # Metrics now return a bare signed scalar (Task 5); no direction tuple.
+    def metric_fn(logits, example, model, **_):
         row = logits[0]  # [seq, d]
         if kind == "linear":
-            return (row * W).sum(), 1
-        return 0.5 * (row ** 2).sum(), 1  # quadratic
+            return (row * W).sum()
+        return 0.5 * (row ** 2).sum()  # quadratic
     return metric_fn
 
 
@@ -62,10 +63,3 @@ def test_steps_one_is_clean_point():
     grad = integrated_gradient_grad_x(FakeModel(), tokens, "hp", acts_clean, acts_cf,
                                       make_metric("quad", None), None, 1)
     assert torch.allclose(grad, acts_clean, atol=1e-5), (grad - acts_clean).abs().max()
-
-
-if __name__ == "__main__":
-    test_linear_metric_recovers_constant_gradient()
-    test_quadratic_metric_averages_interpolation_points()
-    test_steps_one_is_clean_point()
-    print("integrated-gradients checks passed")
