@@ -304,11 +304,12 @@ def select_features(
     q: float = 1.0,
     block_col: str | None = None,
     n0: float = 50.0,
+    pool_col: str = "site_ordinal",
     **recurrence_kwargs,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """Run the full pipeline. Returns (screened df, feature table, summary)."""
     df = add_abs_and_sign(df) if "abs_attr" not in df.columns else df
-    df = mad_screen(df, q=q, n0=n0)
+    df = mad_screen(df, q=q, n0=n0, pool_col=pool_col)
     feats = recurrence_test(df, q=q, block_col=block_col, **recurrence_kwargs)
     summary = pd.Series({
         "groups": df.groupby(GROUP_COLS).ngroups,
@@ -412,6 +413,8 @@ def select_calibrated(nodes_raw: pd.DataFrame, cfg) -> pd.DataFrame:
         block_col=cfg.selection.block_col,
         min_recurrence_frac=cfg.selection.min_recurrence,
         min_sign_consistency=cfg.selection.min_sign_consistency,
+        min_median_abs=cfg.selection.min_median_abs,
+        pool_col=cfg.selection.screen_pool_col,
     )
     feats.attrs["summary"] = summary
     return feats

@@ -40,3 +40,23 @@ def test_completeness_is_the_complement_s_faithfulness():
     scores 1 (nothing captured) and one whose complement is dead scores 0."""
     assert faithfulness(f_c=1.0, f_m=1.0, f_empty=0.0) == pytest.approx(1.0)
     assert faithfulness(f_c=0.0, f_m=1.0, f_empty=0.0) == pytest.approx(0.0)
+
+
+def test_start_layer_zero_keeps_every_block_but_not_embed():
+    """Their ablation.py filters submodules `>= start_layer` with default -1,
+    which keeps every block; its faithfulness script also passes
+    include_embed=False. start_layer=0 reproduces both at once, since embed
+    carries block=-1."""
+    suite = build_suite("pythia-marks")
+    assert resolve_start_layer(suite, 0) == 0
+    ablated = [s for s in suite.sites if s.block >= 0]
+    assert len(ablated) == 18, "6 blocks x {attn, mlp, resid}"
+    assert all(s.kind != "embed" for s in ablated)
+
+
+def test_the_two_readings_of_the_one_third_rule_differ():
+    """Paper §3.2 says skip the first 1/3; ablation.py's default skips nothing.
+    Both are reported, so neither is chosen by an unremembered default."""
+    suite = build_suite("pythia-marks")
+    assert resolve_start_layer(suite, -1) == 2      # paper
+    assert resolve_start_layer(suite, 0) == 0       # their code default

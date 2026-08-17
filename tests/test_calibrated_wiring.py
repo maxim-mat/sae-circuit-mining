@@ -18,14 +18,17 @@ def _cfg():
     cfg.selection.min_recurrence = 0.3
     cfg.selection.screen_n0 = 12.0
     cfg.selection.min_sign_consistency = 0.6
+    cfg.selection.min_median_abs = 0.05
+    cfg.selection.screen_pool_col = "kind"
     return cfg
 
 
 def test_screen_q_and_fdr_q_reach_different_parameters(monkeypatch):
     seen = {}
 
-    def fake_select_features(df, q=1.0, block_col=None, n0=50.0, **kw):
-        kw["n0"] = n0
+    def fake_select_features(df, q=1.0, block_col=None, n0=50.0,
+                             pool_col="site_ordinal", **kw):
+        kw.update(n0=n0, pool_col=pool_col)
         seen.update({"q": q, "block_col": block_col, **kw})
         feats = pd.DataFrame({"site_ordinal": [], "feature_idx": [], "selected": []})
         return df, feats, pd.Series(dtype=float)
@@ -38,6 +41,8 @@ def test_screen_q_and_fdr_q_reach_different_parameters(monkeypatch):
     assert seen["min_recurrence_frac"] == 0.3
     assert seen["n0"] == 12.0, "the MAD shrinkage pseudo-count must be searchable"
     assert seen["min_sign_consistency"] == 0.6
+    assert seen["min_median_abs"] == 0.05,         "the effect-size floor is the knob that reintroduces magnitude"
+    assert seen["pool_col"] == "kind"
 
 
 def test_the_two_rates_are_not_the_same_field():

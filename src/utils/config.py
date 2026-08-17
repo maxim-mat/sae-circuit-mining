@@ -70,6 +70,14 @@ class SelectionConfig:
     # A genuine causal contributor should push the metric the same way each
     # time; under the null the score is sign-symmetric. None disables the check.
     min_sign_consistency: Optional[float] = 0.8
+    # Effect-size floor on the selected feature's median |IE|. None disables it.
+    # The recurrence test counts how OFTEN a feature clears the noise floor and
+    # is blind to how far it clears it, so a consistently-tiny feature outranks
+    # a rarely-huge one. This is the knob that reintroduces magnitude.
+    min_median_abs: Optional[float] = None
+    # Level at which the Stage-1 MAD is pooled before shrinkage: "site_ordinal"
+    # pools across examples at one site, "kind" pools attn/mlp/resid separately.
+    screen_pool_col: str = "site_ordinal"
     block_col: Optional[str] = None
 
 
