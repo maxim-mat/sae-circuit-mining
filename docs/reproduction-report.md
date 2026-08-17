@@ -68,20 +68,58 @@ Fig. 7).
 
 ## How to run it
 
+### On a fresh machine
+
+Neither config runs straight from a clone: the datasets are gitignored and both
+configs enable wandb. Three setup steps, then the two runs.
+
 ```bash
-# 0. Verify the processed SAEs reconstruct (plan Task 12 Q1). Stop if this fails.
-C:/Users/Maxim/anaconda3/python.exe -m scripts.check_sae_reconstruction --suite pythia-marks
+# 0a. Dependencies. Install torch FIRST from the wheel index matching your
+#     driver, then the rest. Verified on torch 2.9.1+cu130, RTX 4090.
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
 
-# 1. Smoke test on 5 examples.
-C:/Users/Maxim/anaconda3/python.exe -m pytest tests/test_end_to_end.py -v -m slow
+# 0b. Datasets (gitignored, never committed). All four SVA structures.
+python -m scripts.fetch_data
 
-# 2. The reproduction run: 100 examples, IG 10 steps, agg none, T_N 0.1, T_E 0.01.
-#    Matches scripts/get_circuit.sh EleutherAI/pythia-70m-deduped rc_train 0.1 0.01 none
-C:/Users/Maxim/anaconda3/python.exe main.py -c configs/pythia_marks_rc.yaml \
-    evaluation.num_examples=40
+# 0c. Verify the SAEs reconstruct before trusting anything downstream.
+#     Downloads pythia-70m-deduped + 19 SAEs on first run. Expect PASS.
+python -m scripts.check_sae_reconstruction --suite pythia-marks
 ```
 
-`evaluation.num_examples=40` matches their notebook; the schema default is 100.
+Then the two arms:
+
+```bash
+# ARM A -- Marks: |mean IE| > 0.1
+python main.py -c configs/pythia_marks_rc.yaml     evaluation.num_examples=40 'logging.backend=[]'
+
+# ARM B -- hypothesis-testing selection, identical in every other respect
+python main.py -c configs/pythia_ha_rc.yaml     evaluation.num_examples=40 'logging.backend=[]'
+```
+
+Run A first: the configs differ only inside `selection`, so B reuses A's
+node-attribution hive from the cache and costs one selection pass plus its own
+edges rather than a second attribution run.
+
+The overrides are all defaults you may not want:
+
+| Override | Why |
+|---|---|
+| `'logging.backend=[]'` | both configs ship `backend: [wandb]`; drop it to log to wandb, but `wandb login` first or the run blocks on a credential prompt. `logging.offline=true` is the middle option. Quote it -- brackets are shell glob characters. |
+| `evaluation.num_examples=40` | matches their notebook; the schema default is 100. |
+| `suite.device=cpu` | only if there is no GPU. Pythia-70m will run, slowly. |
+| `data.template_field=case` | records the prompt->template map. Set it *before* the expensive run: it is in the node-attribution cache key, so adding it later forces a recompute. |
+| `run.force=true` | recompute a stage whose parameters are unchanged. |
+
+Flags must precede the dotlist overrides (`main.py -c cfg --stage selection a=1`);
+argparse cannot interleave them with a `nargs="*"` positional.
+
+### Smoke test first
+
+```bash
+python -m pytest tests/ -q -m "not slow"              # ~3 s, 90 tests
+python -m pytest tests/test_end_to_end.py -v -m slow  # ~2 min, 5 examples
+```
 
 ---
 

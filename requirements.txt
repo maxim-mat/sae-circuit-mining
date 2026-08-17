@@ -1,0 +1,27 @@
+# Versions this pipeline was actually run and verified against (2026-08-17).
+# torch is listed without its CUDA suffix on purpose: install it first, from the
+# wheel index matching your driver, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+# The run in docs/reproduction-report.md used torch 2.9.1+cu130 on an RTX 4090.
+
+torch==2.9.1
+transformer-lens==3.3.0
+sae-lens==6.44.2
+transformers==5.10.2
+datasets==5.0.0
+
+omegaconf==2.3.0
+wandb==0.25.1
+
+pandas==2.2.2
+pyarrow==24.0.0
+numpy==1.26.4
+scipy==1.13.1          # calibrated_feature_selection: normal/binomial tails
+
+pytest==7.4.4
+
+# Phase-3 only (src/partial_order.py, src/visualize_model.py). Not imported by
+# the discovery pipeline; install if you are working on the Petri-net direction.
+# networkx==3.2.1
+# pm4py
+# matplotlib
