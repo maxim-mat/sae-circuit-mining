@@ -1,0 +1,44 @@
+# Paired arm to configs/pythia_marks_rc.yaml: IDENTICAL in every respect except
+# selection.method, which swaps Marks' |mean IE| > T for the hypothesis-testing
+# selector in src/calibrated_feature_selection.py. This is the phase-2 research
+# question (spec section 1.2, R6) in its smallest form.
+#
+# Because node_attribution's cache key covers only (suite, data, attribution,
+# seed), the two arms SHARE one node-attribution hive: run the Marks config
+# first and this one reuses it, so the comparison costs one extra selection
+# pass, not a second attribution run. Do not let the two configs drift on any
+# key outside `selection` or that sharing silently stops.
+suite:
+  name: pythia-marks
+data:
+  path: data/marks/rc_train.json
+  loader: sva
+  num_examples: 100
+  use_min_length_only: true
+attribution:
+  method: ig
+  ig_steps: 10
+  metric: sva_logit_diff
+selection:
+  aggregation: none
+  method: calibrated
+  # Stage 1: expected false positives per (example, site) group -> noise floor.
+  screen_q: 1.0
+  # Stage 2: Benjamini-Hochberg level for the across-example recurrence test.
+  fdr_q: 0.05
+  min_recurrence: 0.1
+  # block_col: templated prompts are correlated trials and blocking restores
+  # honest trial counts. The node hive carries no template column yet, so this
+  # stays null and every example counts as an independent trial.
+  block_col: null
+edges:
+  threshold: 0.01
+  template: marks
+  filter_mode: marks
+evaluation:
+  data_path: data/marks/rc_test.json
+  ablation: mean
+logging:
+  backend: [wandb]
+  group: ha-vs-marks
+seed: 42

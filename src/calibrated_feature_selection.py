@@ -389,7 +389,8 @@ def select_calibrated(nodes_raw: pd.DataFrame, cfg) -> pd.DataFrame:
     """
     _, feats, summary = select_features(
         nodes_raw,
-        q=cfg.selection.fdr_q,
+        q=cfg.selection.screen_q,          # Stage 1: false positives per group
+        fdr=cfg.selection.fdr_q,           # Stage 2: BH level across examples
         block_col=cfg.selection.block_col,
         min_recurrence_frac=cfg.selection.min_recurrence,
     )

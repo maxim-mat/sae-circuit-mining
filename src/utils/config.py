@@ -43,8 +43,13 @@ class SelectionConfig:
     aggregation: str = "none"    # "none" | "sum"  (Marks App. A.2)
     method: str = "threshold"    # "threshold" | "calibrated"
     node_threshold: float = 0.1
-    # calibrated-only
+    # calibrated-only. The two rates are NOT the same knob:
+    #   screen_q -- Stage 1, expected false positives per (example, site) group,
+    #               which sets the per-group noise floor c_g.
+    #   fdr_q    -- Stage 2, the Benjamini-Hochberg level for the recurrence
+    #               test across examples.
     fdr_q: float = 0.05
+    screen_q: float = 1.0
     min_recurrence: float = 0.1
     block_col: Optional[str] = None
 
