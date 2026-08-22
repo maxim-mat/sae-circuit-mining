@@ -39,7 +39,9 @@ def select_random(nodes: pd.DataFrame, k: int, seed: int) -> pd.DataFrame:
 def select_screen_magnitude(nodes_raw: pd.DataFrame, nodes: pd.DataFrame,
                             feature_cols: list[str], k: int,
                             screen_q: float, screen_n0: float,
-                            pool_col: str) -> pd.DataFrame:
+                            pool_col: str, scale: str = "log",
+                            method: str = "mad",
+                            scope: str = "group") -> pd.DataFrame:
     """Stage-1 screen, then top-k by summed |IE| over the rows that passed it.
 
     Deliberately NOT a calibrated test: no null, no BH, no recurrence. The
@@ -49,7 +51,8 @@ def select_screen_magnitude(nodes_raw: pd.DataFrame, nodes: pd.DataFrame,
     from src.calibrated_feature_selection import add_abs_and_sign, mad_screen
 
     screened = mad_screen(add_abs_and_sign(nodes_raw), q=screen_q, n0=screen_n0,
-                          pool_col=pool_col)
+                          pool_col=pool_col, scale=scale, method=method,
+                          scope=scope)
     passed = screened[screened["kept_screen"]]
     score = (passed.groupby(feature_cols)["abs_attr"].sum()
              .rename("screen_magnitude").reset_index())

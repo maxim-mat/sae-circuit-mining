@@ -1,0 +1,56 @@
+nohup: ignoring input
+Sweep starting; logs in logs/sweep-20260817-211729
+Plan written to logs/sweep-20260817-211729/plan.txt
+=== [21:17:30] START stage1-curves-n100
+=== [21:33:03] OK stage1-curves-n100 after 15 min
+=== [21:33:03] START stage2-ha_grid-n100
+=== [22:53:11] OK stage2-ha_grid-n100 after 80 min
+=== [22:53:11] START stage3-curves-n1000
+=== [00:11:18] OK stage3-curves-n1000 after 78 min
+=== [00:11:18] START stage4-curves-n10000
+=== [03:15:26] OK stage4-curves-n10000 after 184 min
+=== [03:15:26] ALL STAGES DONE
+
+271 cells in docs/sweep-results.csv
+    n aggregation         selector  nodes  faithfulness_23_mean  completeness_23_mean  minimality_frac_nontrivial
+  100        none       calibrated     48              0.107790              0.099010                    0.458333
+  100        none       calibrated     48              0.107790              0.099010                    0.458333
+  100        none       calibrated     48              0.107790              0.099010                    0.458333
+  100        none       calibrated     48              0.107790              0.099010                    0.458333
+  100        none       calibrated     48              0.107790              0.099010                    0.458333
+  100        none       calibrated     48              0.107790              0.099010                    0.458333
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     51              0.109055              0.098712                    0.431373
+  100        none       calibrated     60              0.155713              0.037042                    0.400000
+  100        none       calibrated     60              0.162928              0.020091                    0.400000
+  ...         ...              ...    ...                   ...                   ...                         ...
+10000        none        threshold     84              0.046081             -0.240132                         NaN
+10000        none        threshold    120              0.249718             -0.026031                         NaN
+10000        none        threshold    195              0.379886             -0.056462                         NaN
+10000        none        threshold    274              0.502141             -0.039926                         NaN
+10000         sum       calibrated    110              0.169697             -0.044386                         NaN
+10000         sum           random     50              0.000028              0.997954                         NaN
+10000         sum           random     84             -0.000017              0.999950                         NaN
+10000         sum           random    125             -0.000024              0.927288                         NaN
+10000         sum           random    187              0.000008              0.999180                         NaN
+10000         sum           random    300             -0.000046              1.006341                         NaN
+10000         sum screen_magnitude     50              0.167709             -0.012811                         NaN
+10000         sum screen_magnitude     84              0.232270             -0.103813                         NaN
+10000         sum screen_magnitude    125              0.294157             -0.111304                         NaN
+10000         sum screen_magnitude    187              0.379955             -0.166903                         NaN
+10000         sum screen_magnitude    300              0.539094             -0.061256                         NaN
+10000         sum        threshold     35              0.124224             -0.026112                         NaN
+10000         sum        threshold     65              0.254070             -0.016317                         NaN
+10000         sum        threshold    119              0.366047             -0.032147                         NaN
+10000         sum        threshold    189              0.469504             -0.089795                         NaN
+10000         sum        threshold    261              0.609367             -0.051338                         NaN

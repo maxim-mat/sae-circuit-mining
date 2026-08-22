@@ -56,6 +56,8 @@ import pandas as pd
 GROUP_COLS = ["example_idx", "site_ordinal"]
 FEATURE_COLS = ["site_ordinal", "feature_idx"]
 
+GLOBAL_KEY = "_global"        # single-group key when the screen has no groups
+
 FP16_SUBNORMAL_MAX = 6.1e-5   # below this, stored fp16 loses relative precision
 FP16_MIN_POSITIVE = 6.0e-8    # below this, stored fp16 underflows to zero
 
@@ -95,17 +97,63 @@ def data_quality_report(df: pd.DataFrame) -> pd.Series:
 # Stage 1 — per-(prompt, layer) calibrated screen
 # ===========================================================================
 
+def screen_group_cols(method: str, scope: str = "group") -> list[str]:
+    """What one screening group is, per estimator and scope.
+
+    scope="group": "mad" pools every token of a (prompt, layer) into one null --
+    the tail is then fitted on thousands of values, at the cost of assuming one
+    noise floor across positions. "z" is the textbook per-(prompt, layer, TOKEN)
+    test, the grain Marks' node identity uses under aggregation="none", but
+    leaves ~10x fewer values per fit. The two differ in grain as well as in
+    estimator; that is deliberate, and the reason both are options.
+
+    scope="global": ONE null for the whole run, which is what Marks' single
+    node_threshold assumes. Groups vanish, so no group can set its own floor --
+    a quiet (prompt, layer) no longer gets a proportionally quiet bar. This is
+    the arm that tests whether per-group calibration helps at all.
+    """
+    if scope == "global":
+        return []
+    return list(GROUP_COLS) + ["token_idx"] if method == "z" else list(GROUP_COLS)
+
+
 def mad_screen(
     df: pd.DataFrame,
-    group_cols: list[str] = GROUP_COLS,
+    group_cols: list[str] | None = None,
     q: float = 1.0,
     n0: float = 50.0,
     pool_col: str = "site_ordinal",
     exclude_subnormals_from_fit: bool = True,
+    scale: str = "log",
+    method: str = "mad",
+    scope: str = "group",
 ) -> pd.DataFrame:
     """Permissive denoising screen with per-group calibration.
 
-    Threshold per group: exp(median + c_g * MAD_shrunk), with
+    method="mad"   : median + 1.4826*MAD per (prompt, layer). Robust: the
+                     signal it is trying to find cannot inflate the floor.
+    scope="global" : fit ONE null over every row instead of one per group --
+                     Marks' assumption, and the control for "is per-group
+                     calibration earning its keep?". pool_col is then moot.
+    method="z"     : mean + sd per (prompt, layer, token) -- a plain z-test at
+                     the grain a node is defined on. Not robust (a few large
+                     IEs raise the bar for everything at that token) and fitted
+                     on ~10x fewer values, but it makes no lognormal claim and
+                     is the screen a reviewer expects to see first.
+
+    scale="log"    : fit median/MAD on log|IE|, threshold exp(med + c*MAD).
+                     The null bulk of |IE| is lognormal-ish, so this is the
+                     calibrated branch (gaussianity_report validates it).
+    scale="linear" : fit and threshold on |IE| itself, med + c*MAD, in the
+                     same units Marks' node_threshold uses. |IE| is a folded,
+                     not symmetric, variable, so c_g = Phi^-1(1 - q/n_g) no
+                     longer delivers exactly q false positives per group --
+                     and Stage 2's null p0 = q/n_g inherits that slack.
+                     Faithfulness is the arbiter here, not the nominal q.
+                     # ponytail: no fold correction; add the half-normal
+                     # quantile if the linear branch ever needs a calibrated q.
+
+    Threshold per group: exp(median + c_g * MAD_shrunk) (log scale), with
       c_g        = Phi^{-1}(1 - q / n_g)   (q expected FPs per group,
                                             n_g = group's OBSERVED size)
       MAD_shrunk = (n_g * MAD_g + n0 * MAD_pool) / (n_g + n0)
@@ -115,6 +163,26 @@ def mad_screen(
     Adds: kept_screen (bool), screen_threshold, c_group, n_group.
     """
     from scipy.stats import norm
+
+    if scale not in ("log", "linear"):
+        raise ValueError(f"scale must be 'log' or 'linear', got {scale!r}")
+    if method not in ("mad", "z"):
+        raise ValueError(f"method must be 'mad' or 'z', got {method!r}")
+    if scope not in ("group", "global"):
+        raise ValueError(f"scope must be 'group' or 'global', got {scope!r}")
+    if group_cols is None:
+        group_cols = screen_group_cols(method, scope)
+    else:
+        group_cols = list(group_cols)
+    if not group_cols:              # one null for everything: a constant key
+        df = df.assign(**{GLOBAL_KEY: 0})
+        group_cols, pool_col = [GLOBAL_KEY], GLOBAL_KEY
+    missing = [c for c in group_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"screen method {method!r} groups on {group_cols}, but {missing} "
+            f"is not in the node hive; regenerate node attribution or use "
+            f"method='mad'.")
 
     df = df if "abs_attr" in df else add_abs_and_sign(df)
     if "is_error" in df:
@@ -133,9 +201,13 @@ def mad_screen(
             fit_vals = vals
         if fit_vals.size == 0:
             continue
-        logs = np.log(fit_vals)
-        med = np.median(logs)
-        mad = np.median(np.abs(logs - med)) * 1.4826
+        x = np.log(fit_vals) if scale == "log" else fit_vals
+        if method == "z":
+            med = float(np.mean(x))
+            mad = float(np.std(x, ddof=1)) if x.size > 1 else 0.0
+        else:
+            med = np.median(x)
+            mad = np.median(np.abs(x - med)) * 1.4826
         rec = dict(zip(group_cols, key if isinstance(key, tuple) else (key,)))
         rec.update({"_med": med, "_mad": mad, "n_group": int(vals.size)})
         stats.append(rec)
@@ -148,7 +220,16 @@ def mad_screen(
         / (st["n_group"] + n0)
     )
     st["c_group"] = norm.ppf(1.0 - (q / st["n_group"]).clip(upper=0.5))
-    st["screen_threshold"] = np.exp(st["_med"] + st["c_group"] * st["_mad_shrunk"])
+    # 1 - q/n_g rounds to 1.0 in float64 once q/n_g < ~1e-16, and norm.ppf(1.0)
+    # is +inf: every threshold becomes inf and the screen silently keeps nothing.
+    if not np.isfinite(st["c_group"]).to_numpy().all():
+        raise ValueError(
+            f"screen q={q} is too small for group sizes ~{int(st['n_group'].median())}: "
+            f"1 - q/n_g underflows to 1.0 and the noise floor becomes infinite. "
+            f"Keep q above ~1e-13, and note that q is a weak knob on the linear "
+            f"scale -- use the Stage-2 magnitude floor (min_median_abs) instead.")
+    thr = st["_med"] + st["c_group"] * st["_mad_shrunk"]
+    st["screen_threshold"] = np.exp(thr) if scale == "log" else thr
 
     df = df.join(
         st.set_index(group_cols)[["screen_threshold", "c_group", "n_group"]],
@@ -213,6 +294,7 @@ def recurrence_test(
     block_col: str | None = None,
     q: float = 1.0,
     fdr: float = 0.05,
+    screen_group_cols: list[str] = GROUP_COLS,
     min_recurrence_frac: float = 0.10,
     min_sign_consistency: float | None = 0.8,
     min_median_abs: float | None = None,
@@ -251,7 +333,13 @@ def recurrence_test(
     if kept_col not in df:
         raise ValueError("Run mad_screen first.")
 
-    p0_case = float((q / df.groupby(GROUP_COLS)[case_col].size()).clip(upper=0.5).mean())
+    # p0 is the SCREEN's per-row pass rate, so it must be computed over the
+    # groups the screen actually used: per-token groups are ~10x smaller, hence
+    # ~10x more permissive per row, and a p0 fitted on the coarse grouping would
+    # call ordinary noise significant.
+    p0_case = float(
+        (q / df.groupby(list(screen_group_cols))[case_col].size())
+        .clip(upper=0.5).mean())
 
     passes = df[df[kept_col]]
     if block_col is not None:
@@ -305,14 +393,28 @@ def select_features(
     block_col: str | None = None,
     n0: float = 50.0,
     pool_col: str = "site_ordinal",
+    scale: str = "log",
+    method: str = "mad",
+    scope: str = "group",
+    recurrence: bool = True,
     **recurrence_kwargs,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """Run the full pipeline. Returns (screened df, feature table, summary)."""
     df = add_abs_and_sign(df) if "abs_attr" not in df.columns else df
-    df = mad_screen(df, q=q, n0=n0, pool_col=pool_col)
-    feats = recurrence_test(df, q=q, block_col=block_col, **recurrence_kwargs)
+    df = mad_screen(df, q=q, n0=n0, pool_col=pool_col, scale=scale,
+                    method=method, scope=scope)
+    feats = recurrence_test(df, q=q, block_col=block_col,
+                            screen_group_cols=screen_group_cols(method, scope)
+                            or [GLOBAL_KEY],
+                            **recurrence_kwargs)
+    if not recurrence:
+        # Stage 1 alone. recurrence_test's table IS the screen's alphabet (one
+        # row per feature that passed somewhere), so keeping all of it drops the
+        # test while leaving every diagnostic column intact for comparison.
+        feats["selected"] = True
     summary = pd.Series({
         "groups": df.groupby(GROUP_COLS).ngroups,
+        "recurrence": float(recurrence),
         "median_c": float(df["c_group"].median()),
         "screen_pass_rows": int(df["kept_screen"].sum()),
         "alphabet_tested": len(feats),
@@ -415,6 +517,10 @@ def select_calibrated(nodes_raw: pd.DataFrame, cfg) -> pd.DataFrame:
         min_sign_consistency=cfg.selection.min_sign_consistency,
         min_median_abs=cfg.selection.min_median_abs,
         pool_col=cfg.selection.screen_pool_col,
+        scale=cfg.selection.screen_scale,   # Stage 1: log|IE| or raw |IE|
+        method=cfg.selection.screen_method, # Stage 1: robust MAD or plain z
+        scope=cfg.selection.screen_scope,   # Stage 1: per-group or one global null
+        recurrence=cfg.selection.recurrence,  # Stage 2 on/off
     )
     feats.attrs["summary"] = summary
     return feats

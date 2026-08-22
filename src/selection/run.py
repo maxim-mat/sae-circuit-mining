@@ -98,7 +98,8 @@ def run_selection(cfg, node_dir: Path, out_dir: Path) -> dict:
         nodes = select_screen_magnitude(
             raw, nodes, calibrated_feature_cols(cfg), cfg.selection.k,
             cfg.selection.screen_q, cfg.selection.screen_n0,
-            cfg.selection.screen_pool_col)
+            cfg.selection.screen_pool_col, cfg.selection.screen_scale,
+            cfg.selection.screen_method, cfg.selection.screen_scope)
     else:
         raise ValueError(
             f"Unknown selection method {cfg.selection.method!r}; expected one of "

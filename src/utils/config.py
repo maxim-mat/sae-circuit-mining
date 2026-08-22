@@ -87,6 +87,24 @@ class SelectionConfig:
     # Level at which the Stage-1 MAD is pooled before shrinkage: "site_ordinal"
     # pools across examples at one site, "kind" pools attn/mlp/resid separately.
     screen_pool_col: str = "site_ordinal"
+    # Scale the Stage-1 screen is fitted and thresholded on: "log" (the null
+    # bulk of |IE| is lognormal-ish, the calibrated default) or "linear" (fit
+    # and threshold on raw |IE|, the units Marks' node_threshold works in).
+    # "linear" trades the exact q-per-group arithmetic for comparability with
+    # the threshold arm -- see mad_screen's docstring.
+    screen_scale: str = "log"
+    # Stage-1 estimator: "mad" (robust median/MAD, pooled over the tokens of a
+    # (prompt, layer)) or "z" (plain mean/sd, one test per (prompt, layer,
+    # token)). "z" changes the GRAIN as well as the estimator -- see
+    # screen_group_cols -- and Stage 2's null pass rate follows it.
+    screen_method: str = "mad"
+    # "group" fits one null per screening group; "global" fits ONE null over the
+    # whole run, which is the assumption behind Marks' single node_threshold.
+    screen_scope: str = "group"
+    # Stage 2 on/off. False keeps every feature the screen ever passed, which
+    # decomposes the selector: if the screen alone matches, the recurrence test
+    # is not what distinguishes this arm from Marks'.
+    recurrence: bool = True
     block_col: Optional[str] = None
 
 
