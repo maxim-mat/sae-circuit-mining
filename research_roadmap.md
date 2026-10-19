@@ -61,6 +61,32 @@ evaluation. Framing/extensions run in parallel once results exist.
 - Decide `ie_weighting="count"` vs `"normalized_ie"` empirically (if the net
   is unchanged, `count` is the simpler story).
 - Monitor `mean_concurrent_per_case` as an over-parallelization alarm.
+- **ILP² Miner ported** (2026-10-19): `src/discovery/ilp2.py::discover_ilp2`,
+  scipy HiGHS, tested in `tests/test_ilp2.py`; deviations from the reference
+  are listed in its module docstring. Still open: noise handling (it needs
+  every order to replay), isomorphism-aware merging, a builder for the
+  per-prompt causal orders, and validation on the paper's logs. Original note:
+  It mines Petri nets directly from
+  partial orders, which is what the per-prompt causal orders are, so it
+  removes the linearisation step. Folz-Weinstein, Bergenthum, Desel & Kovář,
+  "ILP² Miner – Process Discovery for Partially Ordered Event Logs Using
+  Integer Linear Programming", PETRI NETS 2023 (LNCS 13929). The only
+  implementation is browser-side TypeScript + glpk.js (ILPN/ILPN-Components,
+  `src/lib/algorithms/pn/synthesis/ilp2-miner/`, ~150 lines). Unlike eST², it
+  has no activity cap. Target: `scipy.optimize.milp` (HiGHS, already
+  installed, and free of the torch/OpenMP abort that hits pm4py's ILP).
+  - Formulation: per partial-order event, a firing-rule inequality plus a
+    token-flow equality; per partial order, an initial-marking equality;
+    objective = minimise the sum of token-flow variables; then one ILP per
+    one-way directly-follows pair (a, b), forcing out(a) ≥ 1 and in(b) ≥ 1.
+    Arc weights and initial marking are binary.
+  - Add what theirs lacks: merge identical partial orders (one token-flow
+    block per variant, weighted by count; rc prompts are near-identical),
+    and decide on noise handling, since theirs requires every partial order
+    to replay.
+  - Validate against the paper's example logs, and against their web UI
+    (fernuni-hagen.de/ilovepetrinets/shark), whose input is the text format
+    `.type po` / `.events <id> <label>` / `.arcs <src> <dst>`.
 
 ## 3. Evaluation (determines whether the paper lands)
 

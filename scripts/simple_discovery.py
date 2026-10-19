@@ -8,7 +8,8 @@ one prompt and its events are the rows that survived in it.
     python -m scripts.simple_discovery
 
 Edit the variables below, then run. Writes outputs/nets/<EXPERIMENT_NAME>/
-with net.pnml (net + initial/final marking) and manifest.json.
+with net.pnml (net + initial/final marking), net.svg (figure) and
+manifest.json.
 """
 from __future__ import annotations
 
@@ -72,6 +73,8 @@ def main():
     # (eST-Miner, conformance) reads it directly.
     out_dir.mkdir(parents=True, exist_ok=True)
     pm4py.write_pnml(net, im, fm, str(out_dir / "net.pnml"))
+    # SVG: vector, so large nets stay legible when zoomed. Needs Graphviz.
+    pm4py.save_vis_petri_net(net, im, fm, str(out_dir / "net.svg"))
 
     params = {
         "node_dir": str(NODE_DIR),

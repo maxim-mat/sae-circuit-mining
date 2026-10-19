@@ -19,8 +19,10 @@ signed per-position effects (spec D2).
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import time
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -297,3 +299,189 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
         "mean_total_effect": mean_total_effect,
         "runtime_s": round(time.time() - started, 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# Set IE: the joint effect of patching several nodes at once.
+#
+# A node is (site_ordinal, token_idx, feature_idx), feature_idx = -1 being the
+# SAE error. For an antichain A (no node reaches another),
+#     IE(m; A) = m(x_clean | do(a = a_patch  for all a in A)) - m(x_clean),
+# estimated with integrated gradients along ONE path on which only A's nodes
+# move from clean to patch (Marks et al., arXiv:2403.19647; IG as in Hanna et
+# al., arXiv:2403.17806). A linear estimator would make IE(A) the sum of its
+# members' IEs by construction, which is why only "ig" is meaningful here.
+#
+# NOT comparable with the hive's per-node IEs: integrated_gradient_grad_x moves
+# a site's whole activation, so a hive IE is a feature's share of that joint
+# move. For Delta(A) = IE(A) - sum IE(a), take the individual terms from
+# set_ie([a]) as well.
+# ---------------------------------------------------------------------------
+
+def set_ie(model, saes, suite, nodes, clean_tokens, patch_tokens, metric_fn,
+           example=None, method: str = "ig", steps: int = 10) -> float:
+    """IE of patching every node in `nodes` jointly, for one example: nde with
+    nothing blocked.
+
+    `nodes` must be an antichain (see reachable_pairs; all_set_ies enforces it).
+    The patch is added to each site's recomputed activation, which is exact only
+    when no node in the set lies downstream of another.
+    """
+    if method != "ig":
+        warnings.warn(f"set IE with method={method!r} is the sum of the members' "
+                      "individual IEs; only 'ig' captures their interaction",
+                      stacklevel=2)
+    return nde(model, saes, suite, nodes, [], clean_tokens, patch_tokens, metric_fn,
+               example, method, steps)
+
+
+def nde(model, saes, suite, nodes, block, clean_tokens, patch_tokens, metric_fn,
+        example=None, method: str = "ig", steps: int = 10) -> float:
+    """Natural direct effect of patching `nodes` (A) with `block` (B) held clean:
+
+        NDE(m; A, B) = m(x_clean | do(a = a_patch for a in A, b = b_clean for b in B))
+                       - m(x_clean),     one example.
+
+    set_ie(A) - nde(A, B) is the natural indirect effect of A through B (Pearl,
+    "Direct and Indirect Effects", UAI 2001). IG along the path on which only A
+    moves; each blocked node is re-read from its site's recomputed activation and
+    reset to its clean value, so nothing downstream sees it change. Blocking a
+    node that A cannot reach changes nothing. `method` other than "ig" takes the
+    gradient at the clean point (still a valid first-order NDE, not a sum).
+    """
+    if method != "ig":
+        steps = 1                      # gradient at the clean point
+    if not nodes:
+        raise ValueError("nde needs at least one node to patch")
+    if any(t < 0 for _, t, _ in [*nodes, *block]):
+        raise ValueError("set IE / NDE need position-resolved nodes (token_idx >= 0); "
+                         "aggregation='sum' nodes have token_idx = -1")
+    if set(nodes) & set(block):
+        raise ValueError(f"nodes both patched and blocked: {set(nodes) & set(block)}")
+
+    by_ord = {s.ordinal: s for s in suite.sites}
+    by_hook = {s.hook: s for s in suite.sites}
+    hooks = sorted({by_ord[o].hook for o, _, _ in [*nodes, *block]})
+    with torch.no_grad():
+        _, clean = model.run_with_cache(clean_tokens, names_filter=hooks)
+        _, patch = model.run_with_cache(patch_tokens, names_filter=hooks)
+
+    # Per site: the residual-space move that takes A's nodes there from clean to
+    # patch. Decode is affine, so decode(f with A patched) - decode(f) is exactly
+    # the sum of the features' moves.
+    moves, fc_of, errc_of = {}, {}, {}
+    for hook in hooks:
+        sae = saes[by_hook[hook].sae_id]
+        xc, xp = clean[hook][0], patch[hook][0]
+        fc, fp = sae.encode(xc.unsqueeze(0))[0], sae.encode(xp.unsqueeze(0))[0]
+        fc_of[hook] = fc
+        errc_of[hook] = xc - sae.decode(fc.unsqueeze(0))[0]
+        here = [(t, f) for o, t, f in nodes if by_ord[o].hook == hook]
+        if not here:
+            continue
+        f_moved = fc.clone()
+        move = torch.zeros_like(xc)
+        for t, f in here:
+            if f == -1:
+                move[t] += (xp - sae.decode(fp.unsqueeze(0))[0])[t] - errc_of[hook][t]
+            else:
+                f_moved[t, f] = fp[t, f]
+        moves[hook] = (move + sae.decode(f_moved.unsqueeze(0))[0]
+                       - sae.decode(fc.unsqueeze(0))[0]).detach()
+    blocked = {h: [(t, f) for o, t, f in block if by_ord[o].hook == h] for h in hooks}
+
+    ref = next(iter(moves.values()))
+    alphas = torch.arange(steps, device=ref.device, dtype=ref.dtype) / steps
+    # Zero leaves added at each patched site carry d(metric)/d(activation) at
+    # every alpha; same left-Riemann path as integrated_gradient_grad_x.
+    leaves = {h: torch.zeros(steps, *m.shape, dtype=m.dtype, device=m.device,
+                             requires_grad=True) for h, m in moves.items()}
+
+    def hook_fn(tensor, hook):
+        h = hook.name
+        out = tensor
+        if blocked[h]:
+            # Read B from the incoming activation, BEFORE adding A's same-site
+            # move: same-site features are siblings, and re-encoding after the
+            # move would let A leak into B through the encoder.
+            sae = saes[by_hook[h].sae_id]
+            f = sae.encode(tensor)
+            f_reset = f.clone()
+            fix = torch.zeros_like(tensor)
+            for t, feat in blocked[h]:
+                if feat == -1:
+                    fix[:, t] += errc_of[h][t] - (tensor - sae.decode(f))[:, t]
+                else:
+                    f_reset[:, t, feat] = fc_of[h][t, feat]
+            out = tensor + fix + sae.decode(f_reset) - sae.decode(f)
+        if h in moves:
+            out = out + alphas.view(-1, 1, 1) * moves[h] + leaves[h]
+        return out
+
+    logits = model.run_with_hooks(clean_tokens.repeat(steps, 1),
+                                  fwd_hooks=[(h, hook_fn) for h in hooks])
+    total = sum(metric_fn(logits=logits[i:i + 1], example=example, model=model,
+                          tokens=clean_tokens) for i in range(steps))
+    model.zero_grad(set_to_none=True)
+    total.backward()
+    return float(sum((leaves[h].grad.mean(dim=0) * m).sum() for h, m in moves.items()))
+
+
+def reachable_pairs(model, suite, tokens) -> set:
+    """All ((site_ordinal, token), (site_ordinal, token)) pairs (u, v) where u's
+    activation can change v's.
+
+    Read off the Jacobian's sparsity, so it follows the model's real wiring:
+    causal masking, per-token MLPs and parallel attn || mlp blocks all give exact
+    zero gradients, while GELU, softmax and LayerNorm never do -- the pattern is
+    structural, not input-dependent. One backward per (site, token); a random
+    projection keeps components from cancelling. Same-site pairs are never
+    reachable: features of one SAE are siblings, not ancestors.
+    """
+    acts, leaves = {}, {}
+
+    def hook_fn(tensor, hook):
+        leaves[hook.name] = torch.zeros_like(tensor, requires_grad=True)
+        acts[hook.name] = tensor + leaves[hook.name]
+        return acts[hook.name]
+
+    model.run_with_hooks(tokens[:1], fwd_hooks=[(s.hook, hook_fn) for s in suite.sites])
+    seq = tokens.shape[1]
+    reach = set()
+    for v in suite.sites:
+        ups = [u for u in suite.sites if u.ordinal < v.ordinal]
+        if not ups:
+            continue
+        for tv in range(seq):
+            out = (acts[v.hook][0, tv] * torch.randn_like(acts[v.hook][0, tv])).sum()
+            grads = torch.autograd.grad(out, [leaves[u.hook] for u in ups],
+                                        retain_graph=True, allow_unused=True)
+            for u, g in zip(ups, grads):
+                if g is None:
+                    continue
+                for tu in g[0].abs().sum(dim=-1).nonzero().flatten().tolist():
+                    reach.add(((u.ordinal, tu), (v.ordinal, tv)))
+    return reach
+
+
+def all_set_ies(model, saes, suite, candidates, n, clean_tokens, patch_tokens,
+                metric_fn, example=None, method: str = "ig", steps: int = 10,
+                reach: set | None = None) -> dict:
+    """set_ie of every size-n subset of `candidates` whose nodes are pairwise
+    unreachable, for one example. Returns {node tuple: IE}.
+
+    Pass `reach` (from reachable_pairs) when looping over examples of one token
+    length: it depends only on the model and the sequence length.
+    """
+    # ponytail: enumerates C(len(candidates), n) subsets; restrict candidates to
+    # selected nodes, or batch sets into one forward if this gets slow.
+    if reach is None:
+        reach = reachable_pairs(model, suite, clean_tokens)
+    out = {}
+    for subset in itertools.combinations(candidates, n):
+        if any((u[:2], v[:2]) in reach or (v[:2], u[:2]) in reach
+               for u, v in itertools.combinations(subset, 2)):
+            continue
+        out[subset] = set_ie(model, saes, suite, list(subset), clean_tokens,
+                             patch_tokens, metric_fn, example, method, steps)
+    return out
