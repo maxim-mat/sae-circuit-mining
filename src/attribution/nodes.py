@@ -485,3 +485,147 @@ def all_set_ies(model, saes, suite, candidates, n, clean_tokens, patch_tokens,
         out[subset] = set_ie(model, saes, suite, list(subset), clean_tokens,
                              patch_tokens, metric_fn, example, method, steps)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Exact IE: real interventions, no gradients.
+#
+#     IE(m; S) = m(x_clean | do(a = a_patch for a in S)) - m(x_clean)
+#
+# Each set S is one row of a batched forward on the clean prompt. Rows never
+# interact (attention is within a sequence, LayerNorm/MLP per token), so
+# batching changes nothing but speed. At a site holding a node of S, the node is
+# re-read from the INCOMING activation and set to its patch value, so a node
+# downstream of another member is clamped (true do-semantics), unlike set_ie's
+# fixed delta, which is exact only on antichains.
+# ---------------------------------------------------------------------------
+
+def moving_nodes(model, saes, suite, clean_tokens, patch_tokens) -> pd.DataFrame:
+    """Every node whose patch value differs (bitwise) from its clean value, for
+    one example; all other nodes are left out, since do(a = a_patch) on them is
+    the identity on their own.
+
+    Columns site_ordinal, token_idx, feature_idx (-1 = SAE error), f_clean,
+    f_patch (NaN for error nodes). Row order is the node id used by
+    exact_set_ies / pair_reachable.
+    """
+    hooks = [s.hook for s in suite.sites]
+    cols = {k: [] for k in ("site_ordinal", "token_idx", "feature_idx", "f_clean", "f_patch")}
+    with torch.no_grad():
+        _, cc = model.run_with_cache(clean_tokens, names_filter=hooks)
+        _, pc = model.run_with_cache(patch_tokens, names_filter=hooks)
+        for s in suite.sites:
+            sae = saes[s.sae_id]
+            xc, xp = cc[s.hook], pc[s.hook]
+            fc, fp = sae.encode(xc), sae.encode(xp)
+            t, f = (fc[0] != fp[0]).nonzero(as_tuple=True)
+            et = ((xc - sae.decode(fc))[0] != (xp - sae.decode(fp))[0]).any(-1).nonzero().flatten()
+            n_err = len(et)
+            cols["site_ordinal"] += [s.ordinal] * (len(t) + n_err)
+            cols["token_idx"] += t.tolist() + et.tolist()
+            cols["feature_idx"] += f.tolist() + [-1] * n_err
+            cols["f_clean"] += fc[0][t, f].tolist() + [float("nan")] * n_err
+            cols["f_patch"] += fp[0][t, f].tolist() + [float("nan")] * n_err
+    return pd.DataFrame(cols).astype({"site_ordinal": "int16", "token_idx": "int16",
+                                      "feature_idx": "int32"})
+
+
+def exact_set_ies(model, saes, suite, nodes, sets, clean_tokens, patch_tokens, metric_fn,
+                  example=None, batch_size: int = 4096) -> torch.Tensor:
+    """Exact IE of each set, for one example. Returns a CPU tensor [len(sets)].
+
+    nodes: list of (site_ordinal, token_idx, feature_idx), feature_idx = -1 the
+    SAE error. sets: LongTensor [n_sets, k] of indices into `nodes`, one set per
+    row. batch_size rows go through one forward; it is halved on CUDA OOM and
+    the smaller size kept for the rest of the call.
+
+    Assumes sae.decode is affine (true for the sae_lens SAEs used here), so a
+    node's move is decode(f with it patched) - decode(f) regardless of what else
+    moved at that site and position.
+    """
+    if any(t < 0 for _, t, _ in nodes):
+        raise ValueError("exact IE needs position-resolved nodes (token_idx >= 0)")
+    sets = torch.as_tensor(sets, dtype=torch.long)
+    dev = clean_tokens.device
+    by_ord = {s.ordinal: s for s in suite.sites}
+    by_hook = {s.hook: s for s in suite.sites}
+    hook_names = sorted({by_ord[o].hook for o, _, _ in nodes})
+    hook_id = {h: i for i, h in enumerate(hook_names)}
+    n_hook = torch.tensor([hook_id[by_ord[o].hook] for o, _, _ in nodes], device=dev)
+    n_tok = torch.tensor([t for _, t, _ in nodes], device=dev)
+    n_feat = torch.tensor([f for _, _, f in nodes], device=dev)
+
+    def metric(logits):
+        return metric_fn(logits=logits, example=example, model=model, tokens=clean_tokens)
+
+    # One call over the whole batch: per-row calls cost a tokenizer lookup each
+    # (sva_logit_diff), which would rival the forward itself.
+    metric_rows = torch.func.vmap(lambda row: metric(row.unsqueeze(0)))
+
+    with torch.no_grad():
+        _, pc = model.run_with_cache(patch_tokens, names_filter=hook_names)
+        f_patch, err_patch = {}, {}
+        for h in hook_names:
+            sae = saes[by_hook[h].sae_id]
+            fp = sae.encode(pc[h])
+            f_patch[h], err_patch[h] = fp[0], (pc[h] - sae.decode(fp))[0]
+        m_clean = metric(model(clean_tokens))
+
+        def run(chunk):
+            rows = torch.arange(len(chunk), device=dev).repeat_interleave(chunk.shape[1])
+            ids = chunk.flatten()
+
+            def hook_fn(x, hook):
+                h = hook.name
+                sel = n_hook[ids] == hook_id[h]
+                if not sel.any():
+                    return x
+                r, i = rows[sel], ids[sel]
+                t, f = n_tok[i], n_feat[i]
+                sae = saes[by_hook[h].sae_id]
+                x_in = x[r, t]                      # read before anything is written
+                f_in = sae.encode(x_in)
+                rec = sae.decode(f_in)
+                is_feat = f >= 0
+                f_new = f_in.clone()
+                f_new[is_feat.nonzero().flatten(), f[is_feat]] = f_patch[h][t[is_feat], f[is_feat]]
+                delta = sae.decode(f_new) - rec
+                delta[~is_feat] = err_patch[h][t[~is_feat]] - (x_in - rec)[~is_feat]
+                # accumulate: two nodes of one set at the same site and token
+                # each contribute their own move (decode is affine).
+                return x.index_put((r, t), delta, accumulate=True)
+
+            logits = model.run_with_hooks(clean_tokens.expand(len(chunk), -1),
+                                          fwd_hooks=[(h, hook_fn) for h in hook_names])
+            return (metric_rows(logits) - m_clean).cpu()
+
+        out, start = [], 0
+        while start < len(sets):
+            chunk = sets[start:start + batch_size].to(dev)
+            try:
+                out.append(run(chunk))
+            except torch.cuda.OutOfMemoryError:
+                if batch_size == 1:
+                    raise
+                batch_size //= 2
+                torch.cuda.empty_cache()
+                logger.warning("CUDA OOM; batch_size -> %d", batch_size)
+                continue
+            start += len(chunk)
+    return torch.cat(out) if out else torch.empty(0)
+
+
+def pair_reachable(nodes, pairs, reach: set, n_tokens: int) -> torch.Tensor:
+    """Bool [len(pairs)]: whether either node of each pair can change the other,
+    read from reachable_pairs' ((site_ordinal, token), (site_ordinal, token))
+    set. Vectorised so it scales to ~10^8 pairs."""
+    ords = sorted({o for o, _, _ in nodes} | {u[0] for u, _ in reach} | {v[0] for _, v in reach})
+    idx = {o: i for i, o in enumerate(ords)}
+    size = len(ords) * n_tokens
+    R = torch.zeros(size, size, dtype=torch.bool)
+    for (uo, ut), (vo, vt) in reach:
+        R[idx[uo] * n_tokens + ut, idx[vo] * n_tokens + vt] = True
+    R |= R.T.clone()
+    key = torch.tensor([idx[o] * n_tokens + t for o, t, _ in nodes])
+    pairs = torch.as_tensor(pairs, dtype=torch.long)
+    return R[key[pairs[:, 0]], key[pairs[:, 1]]]
