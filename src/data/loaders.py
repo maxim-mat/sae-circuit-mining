@@ -126,8 +126,12 @@ def select_counterfactual(item: dict, name: str | None) -> dict:
 
 def load_mib_examples(path: str, num_examples: int | None, model, counterfactual: str,
                       split: str = "train",
-                      text_column: str | None = None) -> list[Example]:
+                      text_column: str | None = None, *, seed: int) -> list[Example]:
     """Load a MIB-bench dataset, scoped to a single counterfactual.
+
+    num_examples=None keeps every row in dataset order. A cap takes the first N
+    rows of a seeded shuffle, so a run sees the same prompts under every
+    counterfactual and a smaller sample is a prefix of a larger one.
 
     The counterfactual name is NOT stored per row -- it is a config field, so it
     lands in the stage manifest and the cache key, and two counterfactuals
@@ -146,8 +150,14 @@ def load_mib_examples(path: str, num_examples: int | None, model, counterfactual
             f"set data.text_column explicitly."
         )
 
+    indices = list(range(len(dataset)))
+    if num_examples is not None:
+        random.Random(seed).shuffle(indices)
+        indices = indices[:num_examples]
+
     examples: list[Example] = []
-    for idx, item in enumerate(dataset):
+    for idx in indices:
+        item = dataset[idx]
         cf = select_counterfactual(item, counterfactual)
         examples.append(Example(
             clean_prefix=item[column], clean_answer="",
@@ -155,8 +165,6 @@ def load_mib_examples(path: str, num_examples: int | None, model, counterfactual
             meta={"source_idx": idx, "template": item.get("template", ""),
                   "choices": item.get("choices"), "answerKey": item.get("answerKey")},
         ))
-        if num_examples is not None and len(examples) >= num_examples:
-            break
     logger.info("Loaded %d examples from %s (counterfactual=%s)",
                 len(examples), path, counterfactual)
     return examples
@@ -173,5 +181,6 @@ def load_examples(cfg, model, seed: int) -> list[Example]:
     if cfg.loader == "mib":
         return load_mib_examples(cfg.path, cfg.num_examples, model,
                                  counterfactual=cfg.counterfactual,
-                                 split=cfg.split, text_column=cfg.text_column)
+                                 split=cfg.split, text_column=cfg.text_column,
+                                 seed=seed)
     raise ValueError(f"Unknown loader {cfg.loader!r}; expected 'sva' or 'mib'")

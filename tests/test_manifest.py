@@ -1,4 +1,7 @@
 import json
+
+import pytest
+
 from src.utils.manifest import param_hash, stage_dir, find_cached, write_manifest
 
 
@@ -9,11 +12,33 @@ def test_hash_is_order_independent_and_stable():
 
 
 def test_find_cached_misses_when_absent(tmp_path):
-    assert find_cached(str(tmp_path), "node_attribution", {"a": 1}) is None
+    assert find_cached(str(tmp_path), "node_attribution", _node_params()) is None
+
+
+def _node_params(path="x.json", counterfactual=None, **extra):
+    return {"data": {"path": path, "counterfactual": counterfactual}, **extra}
+
+
+def test_mib_node_path_uses_dataset_and_counterfactual(tmp_path):
+    d = stage_dir(str(tmp_path), "node_attribution",
+                  _node_params("mib-bench/ioi", "abc_counterfactual"))
+    assert d == tmp_path / "ioi" / "attributions" / "nodes" / "abc_counterfactual"
+
+
+def test_marks_node_path_drops_split_and_uses_default_counterfactual(tmp_path):
+    d = stage_dir(str(tmp_path), "node_attribution",
+                  _node_params("data/marks/within_rc_train.json"))
+    assert d == tmp_path / "within_rc" / "attributions" / "nodes" / "default"
+
+
+def test_later_stages_keep_the_hashed_path(tmp_path):
+    params = _node_params()
+    assert stage_dir(str(tmp_path), "selection", params) == \
+        tmp_path / "selection" / param_hash(params)
 
 
 def test_find_cached_hits_after_write(tmp_path):
-    params = {"suite": "pythia-marks", "steps": 10}
+    params = _node_params(suite="pythia-marks", steps=10)
     d = stage_dir(str(tmp_path), "node_attribution", params)
     d.mkdir(parents=True)
     (d / "part-0.parquet").write_bytes(b"x")
@@ -82,12 +107,39 @@ def test_changed_params_recompute_into_a_separate_dir(tmp_path):
         calls.append(out_dir)
         return {}
 
-    d1, _ = resolve_stage_output(_cfg(tmp_path, ig_steps=10), "node_attribution", compute)
-    d2, _ = resolve_stage_output(_cfg(tmp_path, ig_steps=20), "node_attribution", compute)
+    d1, _ = resolve_stage_output(_cfg(tmp_path, ig_steps=10), "selection", compute)
+    d2, _ = resolve_stage_output(_cfg(tmp_path, ig_steps=20), "selection", compute)
 
     assert len(calls) == 2
     assert d1 != d2, "different params must not overwrite each other"
     assert d1.exists() and d2.exists(), "old hives are kept, not replaced"
+
+
+def _write_marker(out_dir):
+    (out_dir / "data.parquet").write_bytes(b"x")
+    return {}
+
+
+def test_node_rerun_with_changed_params_is_refused_and_keeps_the_hive(tmp_path):
+    """The node path has no hash, so a changed run lands on the same directory."""
+    d, _ = resolve_stage_output(_cfg(tmp_path, ig_steps=10), "node_attribution", _write_marker)
+
+    with pytest.raises(RuntimeError, match="attribution.ig_steps"):
+        resolve_stage_output(_cfg(tmp_path, ig_steps=20), "node_attribution", _write_marker)
+
+    assert (d / "data.parquet").exists()
+    assert json.loads((d / "manifest.json").read_text())["params"]["attribution"]["ig_steps"] == 10
+
+
+def test_force_allows_a_node_rerun_with_changed_params(tmp_path):
+    resolve_stage_output(_cfg(tmp_path, ig_steps=10), "node_attribution", _write_marker)
+    cfg = _cfg(tmp_path, ig_steps=20)
+    cfg.run.force = True
+
+    d, cached = resolve_stage_output(cfg, "node_attribution", _write_marker)
+
+    assert cached is False
+    assert json.loads((d / "manifest.json").read_text())["params"]["attribution"]["ig_steps"] == 20
 
 
 def test_irrelevant_config_change_still_hits_the_cache(tmp_path):

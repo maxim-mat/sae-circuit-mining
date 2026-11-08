@@ -124,3 +124,41 @@ def test_num_examples_none_still_honours_the_other_filters(tmp_path):
     ex = load_sva_examples(_write(tmp_path, rows), None, FakeModel(),
                            use_min_length_only=False)
     assert len(ex) == 1, "the multi-token answer must still be dropped"
+
+
+def _mib_ids(monkeypatch, n, seed=42, counterfactual="cf"):
+    import sys
+    import types
+
+    from src.data.loaders import load_mib_examples
+
+    class FakeDataset(list):
+        column_names = ["prompt", "cf", "other"]
+
+    rows = FakeDataset({"prompt": f"p{i}", "cf": {"prompt": f"c{i}"},
+                        "other": {"prompt": f"o{i}"}} for i in range(50))
+    fake = types.SimpleNamespace(load_dataset=lambda **_: rows)
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+    examples = load_mib_examples("x", n, None, counterfactual=counterfactual, seed=seed)
+    return [e.meta["source_idx"] for e in examples], examples
+
+
+def test_mib_uncapped_keeps_every_prompt_in_order(monkeypatch):
+    assert _mib_ids(monkeypatch, None)[0] == list(range(50))
+
+
+def test_mib_cap_is_a_seeded_sample_not_the_first_rows(monkeypatch):
+    ids, _ = _mib_ids(monkeypatch, 10)
+    assert ids != list(range(10))
+    assert ids == _mib_ids(monkeypatch, 10)[0]
+    assert ids != _mib_ids(monkeypatch, 10, seed=7)[0]
+
+
+def test_mib_samples_are_comparable_across_sizes_and_counterfactuals(monkeypatch):
+    small, _ = _mib_ids(monkeypatch, 10)
+    large, _ = _mib_ids(monkeypatch, 20)
+    other_cf, examples = _mib_ids(monkeypatch, 10, counterfactual="other")
+    assert large[:10] == small
+    assert other_cf == small
+    assert examples[0].clean_prefix == f"p{small[0]}"
+    assert examples[0].patch_prefix == f"o{small[0]}"

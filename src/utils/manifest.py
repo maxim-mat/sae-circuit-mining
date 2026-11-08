@@ -1,9 +1,10 @@
 """Manifest-based caching for pipeline stages.
 
-Each stage writes its outputs to outputs/<stage>/<param_hash8>/ alongside a
-manifest.json recording the resolved config subtree that produced them, plus
-provenance (git commit, timestamp, row counts). A stage that finds a manifest
-matching its parameters reuses the directory instead of recomputing.
+Each stage writes its outputs to outputs/<stage>/<param_hash8>/ (node attribution:
+outputs/<dataset>/attributions/nodes/<counterfactual>/) alongside a manifest.json
+recording the resolved config subtree that produced them, plus provenance (git
+commit, timestamp, row counts). A stage that finds a manifest matching its
+parameters reuses the directory instead of recomputing.
 
 The manifest is the reproducibility record for the hive: it answers "what
 produced this data" without needing the shell history that created it.
@@ -52,7 +53,26 @@ def param_hash(params: dict) -> str:
 
 
 def stage_dir(output_root: str, stage: str, params: dict) -> Path:
+    """Where `stage` writes: node attribution by dataset and counterfactual,
+    every other stage by parameter hash."""
+    if stage == "node_attribution":
+        data = params["data"]
+        dataset = Path(data["path"]).stem.removesuffix("_train")
+        return (Path(output_root) / dataset / "attributions" / "nodes"
+                / (data["counterfactual"] or "default"))
     return Path(output_root) / stage / param_hash(params)
+
+
+def _changed_params(old: dict, new: dict, prefix: str = "") -> list[str]:
+    """One 'dotted.key: old -> new' line per differing leaf."""
+    changed = []
+    for key in sorted(old.keys() | new.keys()):
+        a, b = old.get(key), new.get(key)
+        if isinstance(a, dict) and isinstance(b, dict):
+            changed += _changed_params(a, b, f"{prefix}{key}.")
+        elif a != b:
+            changed.append(f"{prefix}{key}: {a!r} -> {b!r}")
+    return changed
 
 
 def _git_commit() -> str:
@@ -84,10 +104,14 @@ def find_cached(output_root: str, stage: str, params: dict) -> Path | None:
     Scans sibling directories rather than trusting the hash alone, so a hash
     collision or a schema bump cannot silently serve the wrong data.
     """
-    root = Path(output_root) / stage
-    if not root.is_dir():
-        return None
-    for candidate in sorted(root.iterdir()):
+    if stage == "node_attribution":
+        candidates = [stage_dir(output_root, stage, params)]
+    else:
+        root = Path(output_root) / stage
+        if not root.is_dir():
+            return None
+        candidates = sorted(root.iterdir())
+    for candidate in candidates:
         mpath = candidate / "manifest.json"
         if not mpath.is_file():
             continue           # crashed or in-progress run
@@ -130,6 +154,16 @@ def resolve_stage_output(cfg, stage: str, compute_fn):
             return hit, True
 
     out_dir = stage_dir(root, stage, params)
+    # The node path carries no hash, so a run with other parameters lands on the
+    # same directory; clearing it would silently destroy a finished hive.
+    if (stage == "node_attribution" and not cfg.run.force
+            and (out_dir / "manifest.json").is_file()):
+        old = json.loads((out_dir / "manifest.json").read_text())["params"]
+        changed = "; ".join(_changed_params(old, params)) or "schema version"
+        raise RuntimeError(
+            f"{out_dir} already holds a finished run with different parameters "
+            f"({changed}). Pass run.force=true to overwrite it."
+        )
     if out_dir.exists():
         logger.info("[%s] clearing %s before recompute", stage, out_dir)
         shutil.rmtree(out_dir)

@@ -160,7 +160,8 @@ def main():
         cfg = load_config(BASE, [
             f"data.num_examples={n}",
             "edges.enabled=false",
-            f"run.output_root={args.output_root}",
+            # One root per n: the node path has no hash, so n's would collide.
+            f"run.output_root={args.output_root}/n{n}",
             "logging.backend=[]",
         ])
         from src.attribution.nodes import run_node_attribution
@@ -180,7 +181,7 @@ def main():
             f"evaluation.num_examples="
             f"{min(args.max_eval_n, max(1, int(n * TEST_FRACTION)))}",
             "edges.enabled=false",
-            f"run.output_root={args.output_root}",
+            f"run.output_root={args.output_root}/n{n}",
             f"evaluation.minimality="
             f"{str(block in args.minimality_for and n <= args.minimality_max_n).lower()}",
             f"logging.backend=[{'wandb' if args.wandb else ''}]",
@@ -212,7 +213,7 @@ def collect(output_root: str, dest: Path) -> None:
     import pandas as pd
 
     rows = []
-    for f in Path(output_root).glob("evaluation/*/manifest.json"):
+    for f in Path(output_root).glob("**/evaluation/*/manifest.json"):
         m = json.loads(f.read_text())
         p, s = m["params"], m["params"]["selection"]
         rows.append({
