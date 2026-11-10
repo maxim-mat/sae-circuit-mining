@@ -71,7 +71,7 @@ class FakeModel:
             self.hooks = saved
 
     def to_tokens(self, text, prepend_bos=False):
-        return CLEAN if text == "clean" else PATCH
+        return {"clean": CLEAN, "patch": PATCH, "short": PATCH[:, :3]}[text]
 
     def __call__(self, tokens):
         x = self.E[tokens]
@@ -205,16 +205,17 @@ def test_edges_into_the_metric_are_the_node_ies():
 NODE_SEED = 7
 
 
-def _node_run(tmp_path, n_examples=3, token_ids=CLEAN[0].tolist()):
+def _node_run(tmp_path, n_examples=3, token_ids=CLEAN[0].tolist(), skipped=()):
     """A finished node run whose hive the destination rules can read. Its token_id
-    column records the clean prompt, as the node stage writes it."""
+    column records the clean prompt, as the node stage writes it; `skipped`
+    examples have no rows, as when the node stage skipped them."""
     cfg = Config()
     cfg.suite.name, cfg.suite.device, cfg.data.path = "s", "cpu", "x"
     cfg.attribution.ig_steps = STEPS
     cfg.seed = NODE_SEED
     node_dir = tmp_path / "ds" / "attributions" / "nodes" / "cf"
     rows = []
-    for ex in range(n_examples):
+    for ex in (e for e in range(n_examples) if e not in skipped):
         for site in range(3):
             rows.append((ex, site, site, "resid", 3, token_ids[3], 1, 0.5 if site == 1 else 0.05))
             rows.append((ex, site, site, "resid", 1, token_ids[1], 2, 0.05))
@@ -226,7 +227,7 @@ def _node_run(tmp_path, n_examples=3, token_ids=CLEAN[0].tolist()):
                         root_path=str(node_dir / "nodes"), partition_cols=["kind", "site_ordinal"])
     (node_dir / "manifest.json").write_text(json.dumps({
         "stage": "node_attribution", "params": stage_params(cfg, "node_attribution"),
-        "git_commit": "abc", "n_examples": n_examples, "n_skipped": 0}))
+        "git_commit": "abc", "n_examples": n_examples - len(skipped), "n_skipped": len(skipped)}))
     return node_dir
 
 
@@ -306,6 +307,23 @@ def test_a_node_run_with_different_examples_is_refused(tmp_path, fake_libs, monk
     monkeypatch.setattr(pe, "load_examples", lambda *a: [])
     with pytest.raises(RuntimeError, match="examples"):
         pe.run_positional_edges(node_dir, METHODS)
+
+
+def test_skipped_examples_are_logged_and_counted(tmp_path, fake_libs, monkeypatch, caplog):
+    node_dir = _node_run(tmp_path, skipped=(1,))
+    monkeypatch.setattr(pe, "load_examples", lambda *a: [
+        Example(clean_prefix="clean", clean_answer="", patch_prefix=p)
+        for p in ("patch", "short", "patch")])
+
+    with caplog.at_level("WARNING", logger=pe.__name__):
+        pe.run_positional_edges(node_dir, METHODS)
+
+    assert any("Example 1" in r.message and "skipping" in r.message for r in caplog.records)
+    for name in METHODS:
+        manifest = json.loads((pe.edge_dir(node_dir, name) / "manifest.json").read_text())
+        assert manifest["n_skipped"] == 1
+        assert manifest["n_examples"] == 2
+        assert set(pe.read_edges(pe.edge_dir(node_dir, name)).example_idx) == {0, 2}
 
 
 def test_examples_are_loaded_with_the_node_runs_seed(tmp_path, fake_libs):

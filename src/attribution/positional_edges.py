@@ -324,8 +324,12 @@ def run_positional_edges(node_dir, methods: dict[str, dict], force: bool = False
     for ex_idx, example in enumerate(examples):
         clean = model.to_tokens(example.clean_prefix, prepend_bos=prepend_bos).to(cfg.suite.device)
         patch = model.to_tokens(example.patch_prefix, prepend_bos=prepend_bos).to(cfg.suite.device)
-        if patch.shape[1] == clean.shape[1]:    # the node run skipped the others too
+        if patch.shape[1] == clean.shape[1]:
             tokens[ex_idx] = (clean, patch)
+        else:                                   # the node run skipped it too (checked below)
+            logger.warning("Example %d: token-length mismatch (clean=%d, patch=%d); skipping.",
+                           ex_idx, clean.shape[1], patch.shape[1])
+    n_skipped = len(examples) - len(tokens)
 
     raw = _read_node_rows(node_dir)
     _check_prompts(node_dir, raw, tokens)
@@ -378,6 +382,8 @@ def run_positional_edges(node_dir, methods: dict[str, dict], force: bool = False
     for name, (out, params) in todo.items():
         write_manifest(out, STAGE, params, {"n_edges": n_edges[name],
                                             "n_destinations": n_destinations[name],
-                                            "n_examples": len(examples), "runtime_s": runtime})
-        logger.info("%s: %d edges into %d destinations", out, n_edges[name], n_destinations[name])
+                                            "n_examples": len(tokens), "n_skipped": n_skipped,
+                                            "runtime_s": runtime})
+        logger.info("%s: %d edges into %d destinations over %d examples (%d skipped)",
+                    out, n_edges[name], n_destinations[name], len(tokens), n_skipped)
     return outs
