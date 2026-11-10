@@ -126,7 +126,8 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
     torch.manual_seed(cfg.seed)
 
     suite = build_suite(cfg.suite.name)
-    model, saes = load_model_and_saes(suite, cfg.suite.device, cfg.suite.dtype)
+    model, saes = load_model_and_saes(suite, cfg.suite.device, cfg.suite.dtype,
+                                      allow_transcoders=True)
     metric_fn = get_metric(cfg.attribution.metric)
     examples = load_examples(cfg.data, model, cfg.seed)
     if not examples:
@@ -175,9 +176,9 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
                 return tensor
             return fwd_hook
 
-        for site in suite.sites:
-            model.add_hook(site.hook, make_fwd_hook(site.hook, acts_clean_by_hook),
-                           dir="fwd")
+        hook_names = {name for site in suite.sites for name in (site.hook, site.read_hook)}
+        for name in hook_names:
+            model.add_hook(name, make_fwd_hook(name, acts_clean_by_hook), dir="fwd")
         clean_logits = model(clean_tokens)
         metric_clean = metric_fn(logits=clean_logits, example=example, model=model,
                                  tokens=clean_tokens)
@@ -187,9 +188,8 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
             metric_clean.backward()
         model.reset_hooks()
 
-        for site in suite.sites:
-            model.add_hook(site.hook, make_fwd_hook(site.hook, acts_patch_by_hook),
-                           dir="fwd")
+        for name in hook_names:
+            model.add_hook(name, make_fwd_hook(name, acts_patch_by_hook), dir="fwd")
         with torch.no_grad():
             patch_logits = model(patch_tokens)
             metric_patch = metric_fn(logits=patch_logits, example=example, model=model,
@@ -214,8 +214,11 @@ def run_node_attribution(cfg, out_dir: Path) -> dict:
             acts_clean = acts_clean_by_hook[site.hook][0]
             acts_cf = acts_patch_by_hook[site.hook][0]
 
-            f_clean = sae.encode(acts_clean.unsqueeze(0))[0]
-            f_corrupt = sae.encode(acts_cf.unsqueeze(0))[0]
+            # A transcoder reads read_hook but its features write to site.hook, so
+            # the gradient and the error term below stay at site.hook. For an SAE
+            # the two hooks are the same.
+            f_clean = sae.encode(acts_clean_by_hook[site.read_hook][0].unsqueeze(0))[0]
+            f_corrupt = sae.encode(acts_patch_by_hook[site.read_hook][0].unsqueeze(0))[0]
 
             # Residual-stream gradient of the metric at this hook point.
             if cfg.attribution.method == "ig":

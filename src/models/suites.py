@@ -24,9 +24,11 @@ Self-check: python -m pytest tests/test_suites.py
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+
+from src.models.transcoders import load_transcoder
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,16 @@ class Site:
     kind: str         # "embed" | "attn" | "mlp" | "resid"
     release: str      # sae_lens release
     sae_id: str       # sae_lens id within the release
-    hook: str         # TransformerLens hook name
+    hook: str         # TransformerLens hook name; where the dictionary's output lives
+    # Transcoders read a different hook than they predict. None = read at `hook`.
+    input_hook: str | None = None
+    # "sae_lens", or "safetensors": release is a HF repo or local directory and
+    # sae_id a file inside it (see src/models/transcoders.py).
+    loader: str = "sae_lens"
+
+    @property
+    def read_hook(self) -> str:
+        return self.input_hook or self.hook
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,8 @@ class Suite:
     model_name: str
     parallel_attn: bool
     sites: tuple[Site, ...]
+    # Model weight processing, for dictionaries that carry no sae_lens metadata.
+    model_kwargs: dict = field(default_factory=dict, hash=False)
 
 
 def _gpt2_res_sites() -> tuple[Site, ...]:
@@ -85,10 +98,27 @@ def _pythia_marks_sites() -> tuple[Site, ...]:
     return tuple(sites)
 
 
+def _gpt2_transcoder_sites() -> tuple[Site, ...]:
+    """Dunefsky et al.'s MLP transcoders (arXiv:2406.11944), in the safetensors
+    repackaging of pchlenski/gpt2-transcoders, whose files name the input hook."""
+    return tuple(
+        Site(ordinal=b, block=b, kind="mlp", release="jacobdunefsky/gpt2small-transcoders",
+             sae_id=f"gpt2-small-dun-chl-mlp-tc{b}/sae.safetensors",
+             hook=f"blocks.{b}.hook_mlp_out", input_hook=f"blocks.{b}.ln2.hook_normalized",
+             loader="safetensors")
+        for b in range(12)
+    )
+
+
 SUITES: dict[str, Suite] = {
     "gpt2-res": Suite("gpt2-res", "gpt2-small", False, _gpt2_res_sites()),
     "pythia-marks": Suite("pythia-marks", "pythia-70m-deduped", True,
                           _pythia_marks_sites()),
+    # ponytail: center_writing_weights is assumed from TransformerLens' defaults at
+    # training time; confirm with a reconstruction check before trusting results.
+    "gpt2-transcoders": Suite("gpt2-transcoders", "gpt2-small", False,
+                              _gpt2_transcoder_sites(),
+                              model_kwargs={"center_writing_weights": True}),
 }
 
 
@@ -136,12 +166,23 @@ def model_load_kwargs(saes) -> dict:
     return dict(kwargs or {})
 
 
-def load_model_and_saes(suite: Suite, device: str, dtype: str = "float32"):
+def load_model_and_saes(suite: Suite, device: str, dtype: str = "float32",
+                        allow_transcoders: bool = False):
     """Load every SAE in the suite, then the model they were trained against.
 
     Returns (model, {sae_id: SAE}). SAEs come first because their metadata is
     what determines how the model must be loaded.
+
+    allow_transcoders is opt-in because a caller that encodes at site.hook gets
+    plausible, wrong numbers from a dictionary that reads site.read_hook.
     """
+    if not allow_transcoders and any(s.read_hook != s.hook for s in suite.sites):
+        raise ValueError(f"Suite {suite.name!r} has transcoder sites, which only node "
+                         "attribution supports so far.")
+    unknown = {s.loader for s in suite.sites} - {"sae_lens", "safetensors"}
+    if unknown:
+        raise ValueError(f"Unknown site loader(s) {sorted(unknown)} in suite {suite.name!r}")
+
     from sae_lens import SAE
     from transformer_lens import HookedTransformer
 
@@ -151,6 +192,9 @@ def load_model_and_saes(suite: Suite, device: str, dtype: str = "float32"):
     for site in suite.sites:
         logger.info("Loading SAE %s/%s", site.release, site.sae_id)
         try:
+            if site.loader == "safetensors":
+                saes[site.sae_id] = load_transcoder(site.release, site.sae_id, device, torch_dtype)
+                continue
             saes[site.sae_id] = SAE.from_pretrained(
                 release=site.release, sae_id=site.sae_id, device=device
             )[0]
@@ -160,10 +204,12 @@ def load_model_and_saes(suite: Suite, device: str, dtype: str = "float32"):
                 f"{suite.name!r}. Check the sae_lens catalog entry."
             ) from e
 
-    kwargs = model_load_kwargs(saes)
+    kwargs = model_load_kwargs(saes) or dict(suite.model_kwargs)
     logger.info("Loading model %s on %s (no_processing + %s)",
                 suite.model_name, device, kwargs or "{}")
     model = HookedTransformer.from_pretrained_no_processing(
         suite.model_name, device=device, dtype=torch_dtype, **kwargs
     )
+    if any(s.read_hook.endswith("hook_mlp_in") for s in suite.sites):
+        model.set_use_hook_mlp_in(True)     # off by default in TransformerLens
     return model, saes
