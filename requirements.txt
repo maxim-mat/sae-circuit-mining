@@ -24,4 +24,5 @@ pytest==7.4.4
 # the discovery pipeline; install if you are working on the Petri-net direction.
 # networkx==3.2.1
 # pm4py
+# powl==2.4.1               # partial-order POWL miner (AGPL-3.0), notebooks/partial_order_traces.ipynb
 # matplotlib
