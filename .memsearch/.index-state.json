@@ -1,11 +1,11 @@
 {
   "collection": "ms_sae_circuit_mining_c77e8244",
   "failed_files": [],
-  "indexed_chunks": 0,
-  "indexed_files": 6,
-  "last_completed_at": "2026-11-01T14:55:01.410762Z",
-  "last_started_at": "2026-11-01T14:54:54.872623Z",
-  "last_success_at": "2026-11-01T14:55:01.410762Z",
+  "indexed_chunks": 35,
+  "indexed_files": 10,
+  "last_completed_at": "2026-11-20T19:41:33.712837Z",
+  "last_started_at": "2026-11-20T19:41:06.490234Z",
+  "last_success_at": "2026-11-20T19:41:33.712837Z",
   "milvus_uri": "~/.memsearch/milvus.db",
   "operation": "index",
   "paths": [
@@ -13,6 +13,6 @@
   ],
   "schema_version": 1,
   "status": "ok",
-  "total_files": 6,
-  "updated_at": "2026-11-01T14:55:01.410762Z"
+  "total_files": 10,
+  "updated_at": "2026-11-20T19:41:33.712837Z"
 }
