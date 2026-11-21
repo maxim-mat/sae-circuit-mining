@@ -107,6 +107,22 @@ def test_merge_keeps_silent_transitions_apart():
     assert sum(t.label is None for t in net.transitions) == 2
 
 
+def test_join_sinks_ends_every_type_in_one_silent_join_and_one_sink():
+    net, im, fm = merge_nets({"x": _chain("x", ["a", "b"]), "y": _chain("y", ["c", "b"])}, join_sinks=True)
+    assert len(im) == 2 and len(fm) == 1
+    sink = next(iter(fm))
+    assert [a.source.label for a in sink.in_arcs] == [None]          # only the silent join feeds it
+    assert _fire(net, im, ["a", "c", "b", None]) == fm
+    assert _fire(net, im, ["a", None]) is None                       # the join waits for every type
+
+
+def test_join_sinks_rejects_a_type_without_a_single_sink():
+    net, im, _ = _chain("x", ["a"])
+    two = Marking({p: 1 for p in net.places})
+    with pytest.raises(ValueError, match="'x'"):
+        merge_nets({"x": (net, im, two)}, join_sinks=True)
+
+
 def test_merge_rejects_a_label_repeated_within_one_type():
     with pytest.raises(ValueError, match="'a'.*'x'"):
         merge_nets({"x": _chain("x", ["a", "a"]), "y": _chain("y", ["a"])})

@@ -66,27 +66,36 @@ def discover_powl_po(partial_orders):
     return powl.convert_to_petri_net(miner.apply(graphs))
 
 
-def merge_nets(nets):
+def merge_nets(nets, join_sinks=False):
     """Merge per-object-type nets into one object-centric net.
 
     Transitions with the same label are fused into one transition, which
     synchronises the types that share it. Places and silent transitions are
-    renamed "<type>:<name>" and kept apart, so every type keeps its own source
-    and sink.
+    renamed "<type>:<name>" and kept apart, so every type keeps its own source.
 
     Args:
         nets: {object_type: (net, initial_marking, final_marking)}.
+        join_sinks: if False, every type keeps its own sink. If True, one
+            silent transition "join" consumes every type's sink token and puts
+            one token into a single place "sink": many sources, one sink.
 
     Returns:
-        (net, initial_marking, final_marking). Each marking is the union of the
-        types' markings.
+        (net, initial_marking, final_marking). The initial marking is the
+        union of the types' initial markings. The final marking is the union
+        of theirs, or {sink: 1} with join_sinks.
 
     Raises:
         ValueError: if a label sits on two transitions of one type's net,
-            because then which copy to fuse is undefined.
+            because then which copy to fuse is undefined; or, with join_sinks,
+            if a type's final marking is not one token in one place.
     """
     out, im, fm = PetriNet("object-centric"), Marking(), Marking()
     fused = {}
+    if join_sinks:
+        bad = [typ for typ, (_, _, f) in nets.items() if list(f.values()) != [1]]
+        if bad:
+            raise ValueError(f"join_sinks needs a final marking of one token in one place; object types {bad!r} "
+                             f"have another")
     for typ, (net, net_im, net_fm) in nets.items():
         repeated = [lab for lab, n in Counter(t.label for t in net.transitions if t.label).items() if n > 1]
         if repeated:
@@ -105,4 +114,12 @@ def merge_nets(nets):
             im[node[p]] = n
         for p, n in net_fm.items():
             fm[node[p]] = n
+    if join_sinks:
+        join, sink = PetriNet.Transition("join", None), PetriNet.Place("sink")
+        out.transitions.add(join)
+        out.places.add(sink)
+        for p in fm:
+            add_arc_from_to(p, join, out)
+        add_arc_from_to(join, sink, out)
+        fm = Marking({sink: 1})
     return out, im, fm
